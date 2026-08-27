@@ -84,6 +84,42 @@ if (Test-Path $WinDeployQt) {
     Write-Warning "windeployqt not found at $WinDeployQt - verify Qt DLLs are present by hand"
 }
 
+# The Visual C++ runtime. A Release build links msvcp140.dll and vcruntime140*.dll
+# dynamically. Most Windows machines already have them from some other
+# application, but not all do, and when they don't the app fails to start with a
+# missing-DLL box that names a Microsoft file and explains nothing. Shipping them
+# app-locally is explicitly permitted for the RELEASE runtime (unlike the debug
+# one) and removes the whole class of problem.
+Write-Host "`n=== 3b/5  Visual C++ runtime ===" -ForegroundColor Cyan
+$redistRoot = Join-Path ${env:VCINSTALLDIR} "Redist\MSVC"
+if (-not (Test-Path $redistRoot)) {
+    # VCINSTALLDIR is only set inside a developer prompt, so fall back to a search.
+    $redistRoot = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory -Recurse -Filter "MSVC" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match "Redist" } |
+                  Select-Object -First 1 -ExpandProperty FullName
+}
+
+$copiedRuntime = $false
+if ($redistRoot -and (Test-Path $redistRoot)) {
+    $crtDir = Get-ChildItem $redistRoot -Directory -Recurse -Filter "x64" -ErrorAction SilentlyContinue |
+              Where-Object { Test-Path (Join-Path $_.FullName "Microsoft.VC*.CRT") } |
+              Select-Object -First 1
+    if ($crtDir) {
+        $crt = Get-ChildItem (Join-Path $crtDir.FullName "Microsoft.VC*.CRT") -Filter "*.dll" -ErrorAction SilentlyContinue
+        foreach ($dll in $crt) {
+            Copy-Item $dll.FullName $Staging -Force
+            $copiedRuntime = $true
+        }
+    }
+}
+if ($copiedRuntime) {
+    Write-Host "  copied the Visual C++ runtime DLLs"
+} else {
+    Write-Warning "Could not find the Visual C++ redistributable DLLs. The app will still"
+    Write-Warning "run on machines that already have them - say so on your download page,"
+    Write-Warning "and link https://aka.ms/vs/17/release/vc_redist.x64.exe"
+}
+
 Write-Host "`n=== 4/5  Licences and docs ===" -ForegroundColor Cyan
 foreach ($f in @("LICENSE", "THIRD-PARTY.md", "README.md")) {
     $src = Join-Path $Root $f
