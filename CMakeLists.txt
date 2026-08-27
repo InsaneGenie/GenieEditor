@@ -123,9 +123,20 @@ target_link_libraries(GenieEditor PRIVATE
 # loses features: no `tls` means HTTPS fails, no `imageformats` means GIF and
 # WebP previews come back blank.
 if(WIN32)
-    set(QT_PLUGIN_ROOT "C:/Users/steve/vcpkg/installed/x64-windows/debug/Qt6/plugins")
+    # Debug and Release need DIFFERENT plugin trees. vcpkg keeps debug builds
+    # under a "debug/" subdirectory, and the two are not interchangeable: a
+    # release binary loading a debug qwindows.dll fails to find a platform
+    # plugin at all, and Qt's error for that mentions neither the plugin nor the
+    # configuration. Hardcoding the debug path meant packaged release builds
+    # shipped with no platforms/ folder and could not start.
+    set(QT_PLUGIN_ROOT_DEBUG   "C:/Users/steve/vcpkg/installed/x64-windows/debug/Qt6/plugins")
+    set(QT_PLUGIN_ROOT_RELEASE "C:/Users/steve/vcpkg/installed/x64-windows/Qt6/plugins")
+    set(QT_PLUGIN_ROOT "$<IF:$<CONFIG:Debug>,${QT_PLUGIN_ROOT_DEBUG},${QT_PLUGIN_ROOT_RELEASE}>")
     foreach(PLUGIN_DIR platforms imageformats tls styles)
-        if(EXISTS "${QT_PLUGIN_ROOT}/${PLUGIN_DIR}")
+        # Tested against the concrete directories rather than QT_PLUGIN_ROOT:
+        # if() cannot evaluate a generator expression, so EXISTS on the latter
+        # is always false and would silently copy nothing.
+        if(EXISTS "${QT_PLUGIN_ROOT_DEBUG}/${PLUGIN_DIR}" OR EXISTS "${QT_PLUGIN_ROOT_RELEASE}/${PLUGIN_DIR}")
             add_custom_command(TARGET GenieEditor POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_directory
                     "${QT_PLUGIN_ROOT}/${PLUGIN_DIR}"
@@ -185,7 +196,6 @@ else()
         "ffmpeg.exe next to GenieEditor.exe, or\n"
         "    * pass -DFFMPEG_EXECUTABLE=C:/path/to/ffmpeg.exe to cmake.")
 endif()
-
 
 # ---------------------------------------------------------------------------
 # whisper.cpp (local, offline transcription — no cloud/network dependency

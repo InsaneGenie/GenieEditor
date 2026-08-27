@@ -12,6 +12,16 @@ The components below are bundled with, or linked by, a GenieEditor release.
 | **Qt 6** | LGPLv3 | Linked dynamically. Window, widgets, networking. |
 | **FFmpeg libraries** (libavformat, libavcodec, libavfilter, libavutil, libswscale, libswresample) | LGPLv2.1 or later | Linked. Media probing, waveform generation, thumbnails. |
 | **ffmpeg executable** | GPLv2 or later (the bundled build includes x264) | Run as a separate process for export. |
+
+### A note on which ffmpeg build to bundle
+
+The gyan.dev **full** build is about 210 MB and dominates the download. The
+**essentials** build is a fraction of that and contains everything GenieEditor
+actually invokes: H.264 via libx264, AAC, and the standard filter set the
+exporter builds its graphs from. Unless you add a feature that needs something
+exotic, bundle essentials.
+
+Both are GPL because of x264, so this changes nothing about licensing.
 | **whisper.cpp** | MIT | Linked. Offline speech transcription. |
 | **ggml** | MIT | Linked, as part of whisper.cpp. |
 

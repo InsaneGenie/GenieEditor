@@ -68,10 +68,66 @@ New-Item -ItemType Directory -Force -Path $Staging | Out-Null
 # the binary as a post-build step, so the whole output directory is the payload.
 Copy-Item -Recurse -Force (Join-Path $ExeDir "*") $Staging
 
+# libmpv, copied explicitly. CMake's TARGET_RUNTIME_DLLS only knows about
+# imported targets, and mpv is linked as a bare path to mpv.lib -- so nothing in
+# the build ever learns that libmpv-2.dll needs to travel with the binary. It is
+# present in the Debug tree only because it was put there by hand, which is
+# exactly the kind of thing that works locally and fails for every user.
+$mpvDir = Split-Path -Parent $MpvLibrary
+$mpvSearchDirs = @(
+    $mpvDir
+    (Join-Path $mpvDir "bin")
+    (Join-Path $mpvDir "..\bin")
+    (Split-Path -Parent $mpvDir)
+    (Join-Path $Root "build\Debug")   # last resort: wherever it was put by hand
+)
+$mpvDlls = @()
+foreach ($dir in $mpvSearchDirs) {
+    if ($dir -and (Test-Path $dir)) {
+        $mpvDlls += @(Get-ChildItem $dir -Filter "*mpv*.dll" -ErrorAction SilentlyContinue)
+    }
+}
+# Still nothing: search the whole mpv folder tree before giving up.
+if (-not $mpvDlls -and (Test-Path $mpvDir)) {
+    $mpvDlls = @(Get-ChildItem $mpvDir -Filter "*mpv*.dll" -Recurse -ErrorAction SilentlyContinue)
+}
+if (-not $mpvDlls) {
+    Write-Host "  looked in:"
+    $mpvSearchDirs | ForEach-Object { Write-Host "    $_" }
+}
+if ($mpvDlls) {
+    $mpvDlls | Select-Object -Unique | ForEach-Object {
+        Copy-Item $_.FullName $Staging -Force
+        Write-Host "  copied $($_.Name)"
+    }
+} else {
+    Write-Warning "libmpv-2.dll NOT FOUND near $MpvLibrary - the app will not start without it."
+    Write-Warning "Find it and copy it into the staging folder by hand."
+}
+
 # windeployqt catches anything the CMake step missed - Qt's own dependency graph
 # is deep enough that hand-listing DLLs eventually gets one wrong.
-$WinDeployQt = Join-Path $VcpkgTools "windeployqt.exe"
-if (Test-Path $WinDeployQt) {
+# vcpkg moves this between layouts (tools/Qt6/bin, tools/qt6/bin, and a separate
+# debug tree), so it is searched for rather than assumed. $VcpkgTools is tried
+# first so an explicit override at the top of this script still wins.
+$WinDeployQt = $null
+$candidates = @(
+    (Join-Path $VcpkgTools "windeployqt.exe")
+    "C:\Users\steve\vcpkg\installed\x64-windows\tools\Qt6\bin\windeployqt.exe"
+    "C:\Users\steve\vcpkg\installed\x64-windows\tools\qt6\bin\windeployqt.exe"
+)
+foreach ($c in $candidates) {
+    if ($c -and (Test-Path $c)) { $WinDeployQt = $c; break }
+}
+if (-not $WinDeployQt) {
+    $found = Get-ChildItem "C:\Users\steve\vcpkg\installed" -Filter "windeployqt.exe" -Recurse -ErrorAction SilentlyContinue |
+             Where-Object { $_.FullName -notmatch "\\debug\\" } |
+             Select-Object -First 1
+    if ($found) { $WinDeployQt = $found.FullName }
+}
+
+if ($WinDeployQt) {
+    Write-Host "  windeployqt: $WinDeployQt"
     Write-Host "  running windeployqt"
     $deployArgs = @(
         "--release"
@@ -81,7 +137,53 @@ if (Test-Path $WinDeployQt) {
     )
     & $WinDeployQt @deployArgs | Out-Null
 } else {
-    Write-Warning "windeployqt not found at $WinDeployQt - verify Qt DLLs are present by hand"
+    Write-Warning "windeployqt.exe not found - Qt DLLs may be missing from the package."
+    Write-Warning "CMake copies most of them, so test the zip on another machine before trusting it."
+}
+
+# Qt plugins, from the RELEASE tree. CMake copies these too, but it only learned
+# to pick the right tree per configuration just now -- and a package that
+# silently omits platforms/qwindows.dll produces a startup failure whose error
+# message mentions neither Qt nor plugins. Cheap to do twice, expensive to miss.
+$qtPluginRoot = "C:\Users\steve\vcpkg\installed\x64-windows\Qt6\plugins"
+if (Test-Path $qtPluginRoot) {
+    foreach ($sub in @("platforms", "imageformats", "tls", "styles")) {
+        $src = Join-Path $qtPluginRoot $sub
+        if (Test-Path $src) {
+            Copy-Item $src (Join-Path $Staging $sub) -Recurse -Force
+            Write-Host "  copied Qt $sub plugins"
+        }
+    }
+} else {
+    Write-Warning "Qt release plugins not found at $qtPluginRoot"
+}
+
+# OpenSSL, for HTTPS. Qt loads its TLS backend as a PLUGIN at runtime, and that
+# plugin in turn loads libssl/libcrypto -- so neither is a link-time dependency
+# of the executable and TARGET_RUNTIME_DLLS never learns about them. Without
+# them Qt silently falls back to its "cert-only" backend, which cannot open a
+# TLS connection at all: the app starts and looks fine, but the GIF and Sounds
+# panels can never load anything. This is the exact failure windeployqt exists
+# to prevent, which is why it has to be done by hand here.
+Write-Host "`n=== 3d/5  OpenSSL ===" -ForegroundColor Cyan
+$vcpkgBin = "C:\Users\steve\vcpkg\installed\x64-windows\bin"
+$sslCopied = @()
+foreach ($name in @("libssl-3-x64.dll", "libcrypto-3-x64.dll")) {
+    if (Test-Path (Join-Path $Staging $name)) { $sslCopied += $name; continue }
+    $src = Join-Path $vcpkgBin $name
+    if (-not (Test-Path $src)) {
+        $found = Get-ChildItem "C:\Users\steve\vcpkg\installed" -Filter $name -Recurse -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch "\\debug\\" } |
+                 Select-Object -First 1
+        if ($found) { $src = $found.FullName }
+    }
+    if (Test-Path $src) {
+        Copy-Item $src $Staging -Force
+        $sslCopied += $name
+        Write-Host "  copied $name"
+    } else {
+        Write-Warning "$name NOT FOUND - HTTPS will not work, so the GIF and Sounds panels will fail."
+    }
 }
 
 # The Visual C++ runtime. A Release build links msvcp140.dll and vcruntime140*.dll
@@ -91,33 +193,41 @@ if (Test-Path $WinDeployQt) {
 # app-locally is explicitly permitted for the RELEASE runtime (unlike the debug
 # one) and removes the whole class of problem.
 Write-Host "`n=== 3b/5  Visual C++ runtime ===" -ForegroundColor Cyan
-$redistRoot = Join-Path ${env:VCINSTALLDIR} "Redist\MSVC"
-if (-not (Test-Path $redistRoot)) {
-    # VCINSTALLDIR is only set inside a developer prompt, so fall back to a search.
-    $redistRoot = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Directory -Recurse -Filter "MSVC" -ErrorAction SilentlyContinue |
-                  Where-Object { $_.FullName -match "Redist" } |
-                  Select-Object -First 1 -ExpandProperty FullName
+# A Release build links msvcp140.dll and vcruntime140*.dll dynamically. Most
+# Windows machines have them from some other application, but not all, and when
+# they don't the app fails to start with a missing-DLL box naming a Microsoft
+# file and explaining nothing. Shipping them app-locally is explicitly permitted
+# for the RELEASE runtime (unlike the debug one).
+#
+# Globbed rather than walked, because the redist path contains two version
+# numbers that change with every Visual Studio update and a recursive search of
+# Program Files is slow and permission-prone.
+$crtDlls = @()
+$globs = @(
+    "C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT\*.dll"
+    "C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT\*.dll"
+)
+foreach ($g in $globs) {
+    $crtDlls += Get-ChildItem $g -ErrorAction SilentlyContinue
 }
 
-$copiedRuntime = $false
-if ($redistRoot -and (Test-Path $redistRoot)) {
-    $crtDir = Get-ChildItem $redistRoot -Directory -Recurse -Filter "x64" -ErrorAction SilentlyContinue |
-              Where-Object { Test-Path (Join-Path $_.FullName "Microsoft.VC*.CRT") } |
-              Select-Object -First 1
-    if ($crtDir) {
-        $crt = Get-ChildItem (Join-Path $crtDir.FullName "Microsoft.VC*.CRT") -Filter "*.dll" -ErrorAction SilentlyContinue
-        foreach ($dll in $crt) {
-            Copy-Item $dll.FullName $Staging -Force
-            $copiedRuntime = $true
-        }
-    }
+if (-not $crtDlls) {
+    # Last resort: the copies already installed on this machine. Same
+    # redistributable files, just already unpacked.
+    Write-Host "  redist folder not found, taking the installed copies instead"
+    $crtDlls = Get-ChildItem "C:\Windows\System32" -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -match "^(msvcp140.*|vcruntime140.*|concrt140)\.dll$" }
 }
-if ($copiedRuntime) {
-    Write-Host "  copied the Visual C++ runtime DLLs"
+
+if ($crtDlls) {
+    $crtDlls | Sort-Object Name -Unique | ForEach-Object {
+        Copy-Item $_.FullName $Staging -Force
+    }
+    Write-Host "  copied $(($crtDlls | Sort-Object Name -Unique).Count) Visual C++ runtime DLLs"
 } else {
-    Write-Warning "Could not find the Visual C++ redistributable DLLs. The app will still"
-    Write-Warning "run on machines that already have them - say so on your download page,"
-    Write-Warning "and link https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    Write-Warning "Visual C++ runtime DLLs not found. The app will still run on machines"
+    Write-Warning "that already have them - link https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    Write-Warning "on your download page."
 }
 
 Write-Host "`n=== 4/5  Licences and docs ===" -ForegroundColor Cyan
@@ -136,6 +246,73 @@ if ($debugDlls) {
     $debugDlls | ForEach-Object { Write-Warning "DEBUG RUNTIME PRESENT: $($_.Name)" }
     throw "Debug runtime DLLs found - this build would not start on a user's machine"
 }
+
+# Strip debug artefacts that the build may have deposited alongside the release
+# output. Two kinds, both pure waste in a shipped package:
+#
+#   *.pdb            debug symbol files. Never loaded at runtime, and Qt's are
+#                    enormous -- qwindowsd.pdb alone runs to tens of megabytes.
+#   plugins ending d Qt's debug naming convention (qwindowsd.dll beside
+#                    qwindows.dll). They need the debug Qt libraries and the
+#                    debug CRT, neither of which ships here, so they could only
+#                    ever fail to load.
+Write-Host "`n=== 3c/5  Removing debug artefacts ===" -ForegroundColor Cyan
+$freed = 0
+
+$pdbs = @(Get-ChildItem $Staging -Recurse -Filter "*.pdb" -ErrorAction SilentlyContinue)
+foreach ($pdb in $pdbs) {
+    $freed += $pdb.Length
+    Remove-Item $pdb.FullName -Force
+}
+if ($pdbs) { Write-Host "  removed $($pdbs.Count) .pdb files" }
+
+# Only removed when the RELEASE twin is present, so a legitimately d-suffixed
+# name can never be deleted out from under the app.
+$debugPlugins = @()
+foreach ($dll in @(Get-ChildItem $Staging -Recurse -Filter "*d.dll" -ErrorAction SilentlyContinue)) {
+    $releaseTwin = Join-Path $dll.DirectoryName ($dll.BaseName.Substring(0, $dll.BaseName.Length - 1) + ".dll")
+    if (Test-Path $releaseTwin) { $debugPlugins += $dll }
+}
+foreach ($dll in $debugPlugins) {
+    $freed += $dll.Length
+    Remove-Item $dll.FullName -Force
+}
+if ($debugPlugins) { Write-Host "  removed $($debugPlugins.Count) debug-build plugins" }
+Write-Host ("  reclaimed {0:N1} MB" -f ($freed / 1MB))
+
+# ffmpeg dominates the download if the wrong build is bundled. Worth saying so
+# once rather than leaving it to be discovered from the finished zip size.
+$ffmpeg = Join-Path $Staging "ffmpeg.exe"
+if (Test-Path $ffmpeg) {
+    $ffMb = (Get-Item $ffmpeg).Length / 1MB
+    if ($ffMb -gt 100) {
+        Write-Warning ("ffmpeg.exe is {0:N0} MB - that is the 'full' gyan.dev build." -f $ffMb)
+        Write-Warning "The 'essentials' build is a fraction of the size and has everything"
+        Write-Warning "this app uses. See the note in THIRD-PARTY.md."
+    }
+}
+
+# Nothing below here can fix a missing DLL, so the package is checked while
+# there is still something to look at. These are the files whose absence stops
+# the app from starting at all, as opposed to degrading a feature.
+$required = @("GenieEditor.exe", "libmpv-2.dll", "Qt6Core.dll", "Qt6Widgets.dll",
+              "Qt6Gui.dll", "Qt6Network.dll", "whisper.dll",
+              # HTTPS needs all three. Missing any one degrades quietly to a
+              # TLS backend that cannot connect, rather than failing loudly.
+              "libssl-3-x64.dll", "libcrypto-3-x64.dll",
+              "tls\qopensslbackend.dll")
+# @() forces an array. Where-Object returns a bare string when exactly one item
+# matches, and += on a string concatenates rather than appends -- which is why
+# the previous run reported "libmpv-2.dllplatforms\qwindows.dll" as one name.
+$missing = @($required | Where-Object { -not (Test-Path (Join-Path $Staging $_)) })
+if (-not (Test-Path (Join-Path $Staging "platforms\qwindows.dll"))) {
+    $missing += "platforms\qwindows.dll"
+}
+if ($missing) {
+    $missing | ForEach-Object { Write-Warning "MISSING: $_" }
+    throw "Required files are missing - the package would not run on a user's machine"
+}
+Write-Host "  all required files present" -ForegroundColor Green
 
 Write-Host "`n=== 5/5  Zipping ===" -ForegroundColor Cyan
 $Zip = Join-Path $Root "dist\GenieEditor-$Version-win64.zip"
