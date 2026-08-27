@@ -415,3 +415,9 @@ export, you'd control it via `mpv_set_property(mpv, "volume", ...)` per
 active track, which requires loading tracks as separate mpv audio streams
 rather than a single file. That's a bigger lift; for now preview plays back
 the raw imported file only.
+
+## License
+
+GenieEditor is copyright (C) 2026 Steve (InsaneGenie) and is licensed under the
+GNU General Public License, version 2 or later. See LICENSE for the full text
+and THIRD-PARTY.md for bundled components.
