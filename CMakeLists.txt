@@ -134,6 +134,53 @@ if(FFMPEG_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
+# ffmpeg EXECUTABLE (needed at runtime by the exporter)
+#
+# Distinct from the FFmpeg libraries linked above, and easy to conflate: the
+# app links libavformat/libavcodec for probing, waveforms and thumbnails, but
+# FFmpegExporter drives the ffmpeg BINARY as a subprocess (see the rationale at
+# the top of FFmpegExporter.h). Linking the libraries successfully therefore
+# says nothing about whether the tool is present — which is exactly why the
+# "ffmpeg not found" dialog can appear on a build that compiled cleanly.
+#
+# vcpkg's ffmpeg port already builds the executable and installs it under
+# tools/ffmpeg, so on this setup it's almost certainly on disk already and just
+# never got copied next to the app. Copying it here mirrors what's done for the
+# Qt plugins above and makes the export work from a fresh clone without anyone
+# having to know any of the above.
+#
+# Not fatal when missing: the app runs fine without it, and everything except
+# export works. The exporter looks on PATH too, so a system install still gets
+# picked up at runtime.
+# ---------------------------------------------------------------------------
+find_program(FFMPEG_EXECUTABLE
+    NAMES ffmpeg
+    HINTS
+        "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/ffmpeg"
+        "${CMAKE_PREFIX_PATH}/tools/ffmpeg"
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/ffmpeg"
+    PATH_SUFFIXES tools/ffmpeg bin
+)
+
+if(FFMPEG_EXECUTABLE)
+    message(STATUS "ffmpeg executable found for export: ${FFMPEG_EXECUTABLE}")
+    add_custom_command(TARGET VideoEditor POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFMPEG_EXECUTABLE}"
+            "$<TARGET_FILE_DIR:VideoEditor>"
+        COMMENT "Copying ffmpeg executable next to VideoEditor (needed for export)")
+else()
+    message(WARNING
+        "ffmpeg executable NOT found — everything works except EXPORT, which "
+        "will show an 'ffmpeg not found' dialog.\n"
+        "  Fix by either:\n"
+        "    * vcpkg install ffmpeg[core,x264]:x64-windows   (then reconfigure), or\n"
+        "    * download a build from https://www.gyan.dev/ffmpeg/builds/ and put "
+        "ffmpeg.exe next to VideoEditor.exe, or\n"
+        "    * pass -DFFMPEG_EXECUTABLE=C:/path/to/ffmpeg.exe to cmake.")
+endif()
+
+# ---------------------------------------------------------------------------
 # whisper.cpp (local, offline transcription — no cloud/network dependency
 # at runtime, matching the rest of the app)
 #

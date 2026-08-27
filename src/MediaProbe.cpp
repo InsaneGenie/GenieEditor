@@ -62,3 +62,25 @@ MediaProbe::VideoInfo MediaProbe::probeVideoInfo(const QString& path) {
     avformat_close_input(&fmt);
     return info;
 }
+
+bool MediaProbe::hasAudioStream(const QString& path) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.toUtf8().constData(), nullptr, nullptr) < 0) {
+        return true; // couldn't tell — see the header's note on failing safe
+    }
+    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+        avformat_close_input(&fmt);
+        return true;
+    }
+
+    bool found = false;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            found = true;
+            break;
+        }
+    }
+
+    avformat_close_input(&fmt);
+    return found;
+}

@@ -63,6 +63,9 @@ private slots:
     void onThumbnailDetailNeeded(int trackIndex, int clipIndex, int desiredFullFileFrameCount);
     void onTimelineZoomAnchorChanged(double anchorSec, int oldPixelX);
     void onClipDeleted();
+    // A move gesture ended with clips in a different track than they started
+    // in — see Timeline::clipsMovedBetweenTracks.
+    void onClipsMovedBetweenTracks();
     void onAddVideoTrackClicked();
     void onAddAudioTrackClicked();
     void onAddOverlayTrackClicked();
@@ -173,6 +176,10 @@ private:
     // A video file gets a clip on the video track plus a companion clip on
     // Audio 1 (see Project.h's multi-track rationale); an audio-only file
     // (wav/mp3/etc) just gets one clip on whichever audio track it landed on.
+    //
+    // The companion audio clip is skipped when the source has no audio stream
+    // (a GIF, a silent export) — MediaProbe::hasAudioStream decides, so the
+    // test is what the file contains rather than what it's named.
     void importVideoFileAt(const QString& path, int videoTrackIndex, double trackPosSec);
     void importAudioOnlyFileAt(const QString& path, int trackIndex, double trackPosSec);
     // Places a still image as an Overlay-track clip. There's no
@@ -334,6 +341,11 @@ private:
     // overlay-add with new coordinates, which costs nothing.
     struct OverlayRenderCache {
         int clipIndex = -1;
+        // Which frame of an animated source is currently rendered. Part of the
+        // key, or an animation would composite frame zero forever: every other
+        // field stays identical from one frame to the next, so without this the
+        // cache reports a hit for the entire clip.
+        int frameIndex = -1;
         int width = -1;
         int height = -1;
         int opacityStep = -1;  // opacity quantised to 0..255

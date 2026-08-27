@@ -24,6 +24,84 @@ QString num(double v, int decimals = 4) {
     return QString::number(v, 'f', decimals);
 }
 
+// How this ffmpeg wants to be handed a filtergraph stored in a file.
+//
+// There is no single spelling that works everywhere, and the two are mutually
+// exclusive rather than merely preferred:
+//
+//   * up to FFmpeg 6:  -filter_complex_script FILE
+//   * from FFmpeg 7:   -/filter_complex FILE   (the generic "read this option's
+//                      value from a file" syntax; the old name was deprecated
+//                      in 7, and REMOVED in 9 — it errors out with
+//                      "Unrecognized option 'filter_complex_script'")
+//
+// Hardcoding either one breaks the other, and the version string can't be
+// trusted to decide: distribution and nightly builds report things like
+// "N-119403-g1234" or "6.1.1-3ubuntu5", so parsing it is guesswork.
+enum class GraphFileOption { Modern, Legacy };
+
+// Probes by RUNNING a trivial graph rather than by inspecting help text or
+// version numbers — the only thing that actually settles the question is
+// whether ffmpeg accepts it. Costs one process launch of a few milliseconds,
+// cached for the life of the process, and it proves the whole mechanism works
+// rather than merely that the option name parses.
+GraphFileOption probeGraphFileOption(const QString& ffmpegPath) {
+    static QString cachedFor;
+    static GraphFileOption cached = GraphFileOption::Modern;
+    if (cachedFor == ffmpegPath) return cached;
+
+    QTemporaryFile probeGraph(QDir::temp().absoluteFilePath("veprobe_XXXXXX.txt"));
+    probeGraph.setAutoRemove(true);
+    bool wrote = false;
+    if (probeGraph.open()) {
+        probeGraph.write("nullsrc=s=16x16:d=0.04[v]");
+        probeGraph.flush();
+        wrote = true;
+    }
+
+    auto accepts = [&](const QString& optionName) {
+        if (!wrote) return false;
+        QProcess probe;
+        probe.start(ffmpegPath, {"-hide_banner", "-nostdin",
+                                 optionName, probeGraph.fileName(),
+                                 "-map", "[v]", "-frames:v", "1", "-f", "null", "-"});
+        if (!probe.waitForFinished(8000)) {
+            probe.kill();
+            probe.waitForFinished(1000);
+            return false;
+        }
+        return probe.exitStatus() == QProcess::NormalExit && probe.exitCode() == 0;
+    };
+
+    // Modern first: it's what any currently-supported ffmpeg wants, so the
+    // common case costs one probe rather than two.
+    if (accepts("-/filter_complex")) {
+        cached = GraphFileOption::Modern;
+    } else if (accepts("-filter_complex_script")) {
+        cached = GraphFileOption::Legacy;
+    } else {
+        // Neither answered — most likely the probe itself couldn't run. Modern
+        // is the better guess for an ffmpeg new enough to be worth supporting,
+        // and the error surfaced from the real render will be specific anyway.
+        cached = GraphFileOption::Modern;
+    }
+
+    cachedFor = ffmpegPath;
+    return cached;
+}
+
+// Whether an overlay source is a multi-frame animation, which decides how the
+// input is looped (see the overlay input args below).
+//
+// Decided by EXTENSION, not by opening the file. This runs while building the
+// argument list, including for the dry-run that produces the previewable
+// command, and the export must not depend on a decode succeeding at that
+// point. GIF is the only animated format routed to overlay tracks on import,
+// so the two agree by construction.
+bool isAnimatedOverlaySource(const QString& path) {
+    return QFileInfo(path).suffix().compare("gif", Qt::CaseInsensitive) == 0;
+}
+
 } // namespace
 
 QString FFmpegExporter::compileExpression(const AnimatedProperty& prop, double clipStartSec,
@@ -141,12 +219,26 @@ QString FFmpegExporter::buildFilterGraph(const Project& project, const Options& 
         for (const Clip& clip : track.clips) {
             if (clip.durationSec() <= 0.0) continue;
 
-            // Looped for the whole project rather than just the clip's span, so
-            // the still has frames at every timestamp and the `enable` window is
-            // the single thing deciding when it's visible. One static frame held
-            // by a decoder costs almost nothing, and it removes an entire class
-            // of PTS-alignment bug.
-            if (inputArgs) *inputArgs << "-loop" << "1" << "-t" << num(total, 3) << "-i" << clip.sourcePath;
+            // Fed for the whole project rather than just the clip's span, so the
+            // source has frames at every timestamp and the `enable` window is the
+            // single thing deciding when it's visible. It removes an entire class
+            // of PTS-alignment bug, and costs almost nothing.
+            //
+            // HOW it's looped depends on the file, and the two options are not
+            // interchangeable. `-loop 1` belongs to the image2 demuxer, which
+            // handles stills; the gif demuxer has no such option and ffmpeg
+            // fails outright rather than ignoring it. Animations instead need
+            // `-ignore_loop 0`, which tells the gif demuxer to honour the file's
+            // own loop flag — nearly every GIF asks to repeat forever, so it
+            // keeps supplying frames for as long as the timeline needs them.
+            if (inputArgs) {
+                if (isAnimatedOverlaySource(clip.sourcePath)) {
+                    *inputArgs << "-ignore_loop" << "0";
+                } else {
+                    *inputArgs << "-loop" << "1";
+                }
+                *inputArgs << "-t" << num(total, 3) << "-i" << clip.sourcePath;
+            }
 
             const double start = clip.trackPosSec;
             const double end = start + clip.durationSec();
@@ -160,6 +252,26 @@ QString FFmpegExporter::buildFilterGraph(const Project& project, const Options& 
             const QString hExpr = QString("max(2,trunc(%1*(%2)*ih/iw/2)*2)").arg(options.width).arg(scaleExpr);
 
             QString chain = QString("[%1:v]format=rgba").arg(inputIndex);
+
+            // An ANIMATION has to be shifted so its first frame lands at the
+            // clip's start on the timeline. Without this the source runs on
+            // timeline time — a GIF placed at 0:05 would begin five seconds into
+            // its own loop, showing a different frame than the preview, which
+            // runs it on clip-relative time. Everything else about a clip
+            // (keyframes, the enable window) is already clip-relative; the
+            // animation has to be too or the two can't agree.
+            //
+            // tpad rather than a plain setpts shift for the same reason the
+            // video chain above uses it: overlay stalls waiting on a second
+            // input that has no frames yet. The padded frames are never seen —
+            // the enable window starts exactly where they end.
+            //
+            // Placed BEFORE geq deliberately; the note below about nothing
+            // coming between geq and scale still holds.
+            if (isAnimatedOverlaySource(clip.sourcePath) && start > 0.0) {
+                chain += QString(",setpts=PTS-STARTPTS,tpad=start_duration=%1:color=black@0")
+                             .arg(num(start, 3));
+            }
 
             // Opacity is applied BEFORE the scale, and the ordering is load-
             // bearing rather than stylistic: geq cannot cope with input whose
@@ -315,9 +427,22 @@ bool FFmpegExporter::exportProject(const Project& project, const Options& option
 
     const QString ffmpeg = resolveFfmpegPath();
     if (ffmpeg.isEmpty()) {
-        m_error = "Couldn't find the ffmpeg program.\n\n"
-                  "Put ffmpeg.exe next to this application, or install it and make sure "
-                  "it's on your PATH, then try again.";
+        // Naming the folder it actually looked in turns this from a dead end
+        // into something checkable — the usual cause is simply that the
+        // executable never got copied next to the app, and seeing the path
+        // makes that obvious rather than a guess.
+        m_error = QString(
+            "Couldn't find the ffmpeg program.\n\n"
+            "Note this is the ffmpeg EXECUTABLE, which is separate from the FFmpeg "
+            "libraries this app is built against — so exporting can fail even though "
+            "everything else works.\n\n"
+            "Looked for it here:\n"
+            "  %1\n"
+            "  (and its ffmpeg\\ and bin\\ subfolders)\n"
+            "  ...then on your PATH.\n\n"
+            "Put ffmpeg.exe in that folder, or install it and make sure it's on your "
+            "PATH, then try again.")
+            .arg(QDir::toNativeSeparators(QCoreApplication::applicationDirPath()));
         return false;
     }
 
@@ -333,7 +458,8 @@ bool FFmpegExporter::exportProject(const Project& project, const Options& option
 
     // The graph goes in a file rather than on the command line. Windows caps a
     // command line at ~32k characters and a project of any size blows straight
-    // past that; -filter_complex_script sidesteps the limit entirely.
+    // past that; handing ffmpeg a file sidesteps the limit entirely. Which
+    // OPTION does that differs by ffmpeg version — see probeGraphFileOption.
     QTemporaryFile graphFile(QDir::temp().absoluteFilePath("veexport_XXXXXX.txt"));
     graphFile.setAutoRemove(true);
     if (!graphFile.open()) {
@@ -346,7 +472,9 @@ bool FFmpegExporter::exportProject(const Project& project, const Options& option
     QStringList args;
     args << "-hide_banner" << "-nostdin" << "-y";
     args << inputArgs;
-    args << "-filter_complex_script" << graphFile.fileName();
+    args << (probeGraphFileOption(ffmpeg) == GraphFileOption::Modern
+                 ? "-/filter_complex" : "-filter_complex_script")
+         << graphFile.fileName();
     args << "-map" << "[vout]";
     if (hasAudio) args << "-map" << "[aout]";
 

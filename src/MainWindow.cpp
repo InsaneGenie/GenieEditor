@@ -439,11 +439,16 @@ void MainWindow::buildUi() {
     // ever using one at a time.
     m_klipyPanel = new KlipyPanel();
     connect(m_klipyPanel, &KlipyPanel::gifReady, this, [this](const QString& path) {
-        // GIFs land on a VIDEO track, not an overlay track. Overlay clips are a
-        // single still QImage plus animated transforms — putting an animated GIF
-        // there would show one frozen frame. The video path decodes it properly
-        // in both the mpv preview and the FFmpeg export.
-        importVideoFileAt(path, /*videoTrackIndex=*/-1, m_project.durationSec());
+        // GIFs land on an OVERLAY track, so they can be scaled, positioned,
+        // rotated and faded over the footage the same way a PNG can. The
+        // overlay compositor decodes every frame and picks the one for the
+        // current moment (see OverlayImageLoader), so the animation plays in
+        // both the preview and the export rather than freezing on frame one.
+        //
+        // At the PLAYHEAD rather than the end of the project: a reaction GIF
+        // belongs over the moment being watched, and appending it past the end
+        // of the footage would put it where there's nothing to react to.
+        importOverlayFileAt(path, /*overlayTrackIndex=*/-1, m_currentTimelineSec);
     });
 
     m_klipyDock = new QDockWidget("GIFs", this);
@@ -500,6 +505,7 @@ void MainWindow::buildUi() {
         hbar->setValue(hbar->value() + deltaPixels); // scrollbar clamps to valid range automatically
     });
     connect(m_timeline, &Timeline::clipDeleted, this, &MainWindow::onClipDeleted);
+    connect(m_timeline, &Timeline::clipsMovedBetweenTracks, this, &MainWindow::onClipsMovedBetweenTracks);
     connect(m_trackHeaderPanel, &TrackHeaderPanel::muteToggled, this, [this](int) {
         m_timeline->update(); // repaint so the muted track's clips dim
     });
@@ -699,6 +705,13 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
         duration = 10.0;
     }
 
+    // A companion audio clip is only created when there's audio to put in it.
+    // GIFs are the obvious case — they have no audio stream at all, so the
+    // paired clip was always empty, drew no waveform, and existed only to be
+    // deleted. Silent MP4s and image sequences get the same treatment, since
+    // this asks the file rather than the file extension.
+    const bool sourceHasAudio = MediaProbe::hasAudioStream(path);
+
     // Clips are added immediately, WITHOUT thumbnails/waveform, so the drop
     // itself feels instant — thumbnail generation (several seeks/decodes)
     // and waveform generation (a full audio decode) are genuinely expensive
@@ -713,13 +726,16 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
     m_project.tracks[videoTrackIndex].clips.push_back(videoClip);
     const int videoClipIndex = m_project.tracks[videoTrackIndex].clips.size() - 1;
 
-    Clip audioClip;
-    audioClip.sourcePath = path;
-    audioClip.sourceInSec = 0.0;
-    audioClip.sourceOutSec = duration;
-    audioClip.trackPosSec = trackPosSec;
-    m_project.tracks[audioTrackIndex].clips.push_back(audioClip);
-    const int audioClipIndex = m_project.tracks[audioTrackIndex].clips.size() - 1;
+    int audioClipIndex = -1;
+    if (sourceHasAudio) {
+        Clip audioClip;
+        audioClip.sourcePath = path;
+        audioClip.sourceInSec = 0.0;
+        audioClip.sourceOutSec = duration;
+        audioClip.trackPosSec = trackPosSec;
+        m_project.tracks[audioTrackIndex].clips.push_back(audioClip);
+        audioClipIndex = m_project.tracks[audioTrackIndex].clips.size() - 1;
+    }
 
     m_timeline->setProject(&m_project); // clip appears immediately, just without visuals yet
     seekTimeline(trackPosSec); // preview the newly imported clip
@@ -742,21 +758,26 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
     });
     thumbWatcher->setFuture(QtConcurrent::run(&ThumbnailGenerator::generate, path, 12, 120, 68));
 
-    // Background waveform generation, same pattern.
-    auto* waveWatcher = new QFutureWatcher<WaveformData>(this);
-    connect(waveWatcher, &QFutureWatcher<WaveformData>::finished, this,
-            [this, waveWatcher, path, audioTrackIndex, audioClipIndex] {
-        const WaveformData waveform = waveWatcher->result();
-        waveWatcher->deleteLater();
-        auto& clips = m_project.tracks[audioTrackIndex].clips;
-        if (audioClipIndex >= 0 && audioClipIndex < clips.size() && clips[audioClipIndex].sourcePath == path) {
-            Clip& c = clips[audioClipIndex];
-            c.waveformPeaks = waveform.peaks;
-            c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.durationSec();
-            m_timeline->update();
-        }
-    });
-    waveWatcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 2000));
+    // Background waveform generation, same pattern — skipped entirely when
+    // there's no audio clip, since a full audio decode of a file with no audio
+    // can only ever produce an empty result.
+    if (audioClipIndex >= 0) {
+        auto* waveWatcher = new QFutureWatcher<WaveformData>(this);
+        connect(waveWatcher, &QFutureWatcher<WaveformData>::finished, this,
+                [this, waveWatcher, path, audioTrackIndex, audioClipIndex] {
+            const WaveformData waveform = waveWatcher->result();
+            waveWatcher->deleteLater();
+            auto& clips = m_project.tracks[audioTrackIndex].clips;
+            if (audioClipIndex < clips.size() && clips[audioClipIndex].sourcePath == path) {
+                Clip& c = clips[audioClipIndex];
+                c.waveformPeaks = waveform.peaks;
+                c.waveformRms = waveform.rms;
+                c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.durationSec();
+                m_timeline->update();
+            }
+        });
+        waveWatcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 0));
+    }
 }
 
 void MainWindow::importOverlayFileAt(const QString& path, int overlayTrackIndex, double trackPosSec) {
@@ -776,10 +797,18 @@ void MainWindow::importOverlayFileAt(const QString& path, int overlayTrackIndex,
         }
     }
 
+    // A still has no intrinsic duration and gets the default; an animation
+    // does, so it starts at exactly one loop. Dropping a two-second reaction
+    // GIF and getting a five-second clip that plays it two and a half times is
+    // never what was meant — and either way the length is a trim away.
+    double lengthSec = kDefaultOverlayClipLenSec;
+    const OverlayFrames animation = OverlayImageLoader::loadFrames(path);
+    if (animation.isAnimated() && animation.loopSec > 0.05) lengthSec = animation.loopSec;
+
     Clip overlayClip;
     overlayClip.sourcePath = path;
     overlayClip.sourceInSec = 0.0;
-    overlayClip.sourceOutSec = kDefaultOverlayClipLenSec; // stills have no intrinsic duration
+    overlayClip.sourceOutSec = lengthSec;
     overlayClip.trackPosSec = trackPosSec;
     m_project.tracks[overlayTrackIndex].clips.push_back(overlayClip);
 
@@ -939,11 +968,12 @@ void MainWindow::importAudioOnlyFileAt(const QString& path, int trackIndex, doub
         if (clipIndex >= 0 && clipIndex < clips.size() && clips[clipIndex].sourcePath == path) {
             Clip& c = clips[clipIndex];
             c.waveformPeaks = waveform.peaks;
+            c.waveformRms = waveform.rms;
             c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.durationSec();
             m_timeline->update();
         }
     });
-    waveWatcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 2000));
+    waveWatcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 0));
 }
 
 void MainWindow::onMediaDropped(const QString& filePath, int trackIndex, double timelineSec) {
@@ -951,7 +981,19 @@ void MainWindow::onMediaDropped(const QString& filePath, int trackIndex, double 
     static const QStringList kOverlayExtensions = {"png", "jpg", "jpeg", "bmp"};
     const QString ext = QFileInfo(filePath).suffix().toLower();
 
-    if (kOverlayExtensions.contains(ext)) {
+    // A GIF is an overlay by default, like any other image — that's what makes
+    // it scalable and positionable over the footage rather than replacing it.
+    //
+    // Dropping one directly on a VIDEO track is the exception, and it stays
+    // supported because it's a different intent: a full-frame GIF used as
+    // footage in its own right. The track the file was dropped on is the
+    // clearest statement of which of the two was meant, so it decides.
+    const bool droppedOnVideoTrack = trackIndex >= 0
+                                  && trackIndex < m_project.tracks.size()
+                                  && m_project.tracks[trackIndex].type == TrackType::Video;
+    if (ext == "gif" && !droppedOnVideoTrack) {
+        importOverlayFileAt(filePath, trackIndex, timelineSec);
+    } else if (kOverlayExtensions.contains(ext)) {
         importOverlayFileAt(filePath, trackIndex, timelineSec);
     } else if (kAudioOnlyExtensions.contains(ext)) {
         importAudioOnlyFileAt(filePath, trackIndex, timelineSec);
@@ -1014,6 +1056,16 @@ void MainWindow::onTimelineZoomAnchorChanged(double anchorSec, int oldPixelX) {
     // scrollbar clamps this to its valid range automatically if it would
     // otherwise go out of bounds (e.g. zooming out near the very start).
     hbar->setValue(hbar->value() + (newPixelX - oldPixelX));
+}
+
+void MainWindow::onClipsMovedBetweenTracks() {
+    // An audio clip that changed track is now played by a different
+    // AudioPlayer, and a video clip that changed track may have changed which
+    // layer wins at the playhead — so this needs the same immediate re-sync a
+    // delete gets, not just whatever the next clock tick happens to do.
+    scheduleTranscriptionScan(); // a source file may have left one track and joined another
+    refreshTrackViews();
+    seekTimeline(m_currentTimelineSec);
 }
 
 void MainWindow::onClipDeleted() {
@@ -1569,7 +1621,14 @@ void MainWindow::syncVideoToTimeline(double timelineSeconds) {
 
 QImage MainWindow::renderOverlayBitmap(int trackIndex, int clipIndex, const Clip& clip,
                                        double localSec, const QSize& canvas, QPoint* outPos) {
-    const QImage source = OverlayImageLoader::load(clip.sourcePath);
+    // Frames rather than a single image: an animated overlay shows a different
+    // one at every moment, and a still is simply the one-frame case of that.
+    // indexAt loops, so stretching the clip past the source's own length keeps
+    // it playing instead of freezing — matching what the export does.
+    const OverlayFrames animation = OverlayImageLoader::loadFrames(clip.sourcePath);
+    const int frameIndex = animation.indexAt(localSec);
+    if (frameIndex < 0) return QImage();
+    const QImage& source = animation.frames[frameIndex];
     if (source.isNull() || source.width() <= 0) return QImage();
 
     const double scale   = std::clamp(clip.anim.scale.valueAt(localSec), 0.005, 4.0);
@@ -1599,6 +1658,7 @@ QImage MainWindow::renderOverlayBitmap(int trackIndex, int clipIndex, const Clip
 
     const bool cacheValid = !cache.rendered.isNull()
                          && cache.clipIndex == clipIndex
+                         && cache.frameIndex == frameIndex
                          && cache.width == targetW
                          && cache.height == targetH
                          && cache.opacityStep == opacityStep
@@ -1630,6 +1690,7 @@ QImage MainWindow::renderOverlayBitmap(int trackIndex, int clipIndex, const Clip
         }
 
         cache.clipIndex = clipIndex;
+        cache.frameIndex = frameIndex;
         cache.width = targetW;
         cache.height = targetH;
         cache.opacityStep = opacityStep;

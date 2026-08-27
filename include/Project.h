@@ -145,6 +145,13 @@ struct Clip {
     // the renderer re-slices peaks[] against waveformSourceDurationSec at
     // draw time. Empty for clips with no audio or where generation failed.
     QVector<float> waveformPeaks;
+
+    // Per-bucket RMS matching waveformPeaks index for index (or empty, for
+    // clips generated before this existed). The renderer fills the RMS as a
+    // solid body inside the translucent peak envelope — see
+    // WaveformGenerator.h for why one measurement was never enough.
+    QVector<float> waveformRms;
+
     double waveformSourceDurationSec = 0.0;
 
     // Frame thumbnails covering the clip's ENTIRE original source file,

@@ -10,9 +10,25 @@ extern "C" {
 #include <cmath>
 #include <algorithm>
 
+namespace {
+// Buckets per second of audio when the caller doesn't specify a count. 200 is
+// one measurement every 5ms, which at the timeline's maximum zoom (800 px/s)
+// still leaves four pixels per bucket — fine enough that interpolating between
+// them draws a curve instead of a staircase.
+constexpr double kBucketsPerSecond = 200.0;
+
+// A floor for very short files, so a two-second clip still gets a dense
+// waveform rather than four hundred buckets.
+constexpr int kMinBuckets = 2000;
+
+// And a ceiling, because this is held in memory for as long as the clip exists.
+// 400k buckets is ~3.2MB across both arrays; past roughly 33 minutes a file
+// loses resolution gradually rather than growing without bound.
+constexpr int kMaxBuckets = 400000;
+} // namespace
+
 WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     WaveformData result;
-    if (peakCount <= 0) return result;
 
     AVFormatContext* fmtCtx = nullptr;
     const QByteArray pathUtf8 = path.toUtf8();
@@ -42,6 +58,13 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     if (durationSec <= 0.0) {
         avformat_close_input(&fmtCtx);
         return result;
+    }
+
+    // Resolution is chosen here rather than by the caller because it depends on
+    // the duration, which isn't known until the container has been opened.
+    if (peakCount <= 0) {
+        peakCount = std::clamp(static_cast<int>(durationSec * kBucketsPerSecond),
+                               kMinBuckets, kMaxBuckets);
     }
 
     AVCodecContext* codecCtx = avcodec_alloc_context3(decoder);
@@ -76,7 +99,10 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     const double samplesPerBucket = std::max(1.0, totalSamplesEstimate / peakCount);
 
     result.peaks.reserve(peakCount + 1);
-    double bucketMax = 0.0;
+    result.rms.reserve(peakCount + 1);
+    double bucketMax = 0.0;      // loudest sample seen in the current bucket
+    double bucketEnergy = 0.0;   // running sum of squares, for the RMS
+    int bucketSamples = 0;
     double sampleCounter = 0.0;
 
     AVPacket* packet = av_packet_alloc();
@@ -96,20 +122,33 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
                     const_cast<const uint8_t**>(frame->data), frame->nb_samples);
 
                 for (int i = 0; i < converted; ++i) {
-                    bucketMax = std::max(bucketMax, static_cast<double>(std::fabs(monoBuf[i])));
+                    const double sample = monoBuf[i];
+                    bucketMax = std::max(bucketMax, std::fabs(sample));
+                    bucketEnergy += sample * sample;
+                    ++bucketSamples;
+
                     sampleCounter += 1.0;
                     if (sampleCounter >= samplesPerBucket) {
                         result.peaks.push_back(static_cast<float>(bucketMax));
+                        result.rms.push_back(static_cast<float>(
+                            std::sqrt(bucketEnergy / bucketSamples)));
                         bucketMax = 0.0;
-                        sampleCounter = 0.0;
+                        bucketEnergy = 0.0;
+                        bucketSamples = 0;
+                        // Subtracting rather than zeroing keeps fractional
+                        // bucket sizes honest — samplesPerBucket is rarely a
+                        // whole number, and zeroing rounds every bucket up,
+                        // which compounds into a real length error by the end.
+                        sampleCounter -= samplesPerBucket;
                     }
                 }
             }
         }
         av_packet_unref(packet);
     }
-    if (sampleCounter > 0.0) {
+    if (bucketSamples > 0) {
         result.peaks.push_back(static_cast<float>(bucketMax));
+        result.rms.push_back(static_cast<float>(std::sqrt(bucketEnergy / bucketSamples)));
     }
 
     av_frame_free(&frame);

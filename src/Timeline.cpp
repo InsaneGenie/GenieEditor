@@ -186,37 +186,155 @@ QString formatPlayheadTimecode(double totalSeconds) {
 // trimmed [sourceInSec, sourceOutSec] window onto the matching slice of the
 // peaks array before drawing — that's what makes waveforms stay correct
 // after a clip has been split or re-trimmed without regenerating anything.
-void drawWaveform(QPainter& p, const QRect& bodyRect, const Clip& clip, const QColor& tint) {
-    if (clip.waveformPeaks.isEmpty() || clip.waveformSourceDurationSec <= 0.0) {
-        return;
+//
+// Two envelopes are drawn, not one: a translucent outer envelope of the peak
+// values and a solid inner body of the RMS. That pairing is what carries the
+// detail. The peak alone is a silhouette of the loudest thing in each column
+// and says nothing about what's underneath it, which is why a single-value
+// waveform flattens into bars — every column with any content in it reaches
+// nearly the same height. The RMS body varies with actual loudness, so speech
+// gets visible shape, breaths and room tone stay legible near the axis, and a
+// transient shows as a spike standing clear of the body instead of merging
+// into it.
+void drawWaveform(QPainter& p, const QRect& bodyRect, const QRect& viewportRect,
+                  const Clip& clip, const QColor& tint) {
+    if (clip.waveformPeaks.isEmpty() || clip.waveformSourceDurationSec <= 0.0) return;
+    if (bodyRect.width() <= 0 || bodyRect.height() <= 0) return;
+
+    // Only the on-screen span is ever computed. At high zoom a clip body can be
+    // tens of thousands of pixels wide with two hundred of them visible, and
+    // the previous column loop ran over the whole width regardless.
+    const QRect visible = bodyRect.intersected(viewportRect);
+    if (visible.width() <= 0) return;
+
+    const QVector<float>& peaks = clip.waveformPeaks;
+    const QVector<float>& rms = clip.waveformRms;
+    const int bucketCount = peaks.size();
+    // Clips imported before RMS existed still have peaks — they fall back to a
+    // fraction of the peak for the body rather than losing their waveform.
+    const bool hasRms = rms.size() == bucketCount;
+
+    // The trim window in FRACTIONAL bucket coordinates. Fractional matters:
+    // rounding to whole buckets makes the waveform jump a bucket at a time
+    // while a trim handle is being dragged, which reads as the audio sliding
+    // around underneath the cut.
+    const double bucketsPerSec = bucketCount / clip.waveformSourceDurationSec;
+    const double windowStart = std::clamp(clip.sourceInSec * bucketsPerSec, 0.0,
+                                          static_cast<double>(bucketCount));
+    const double windowEnd = std::clamp(clip.sourceOutSec * bucketsPerSec, windowStart,
+                                        static_cast<double>(bucketCount));
+    const double windowSpan = windowEnd - windowStart;
+    if (windowSpan <= 0.0) return;
+
+    const double bucketsPerPx = windowSpan / bodyRect.width();
+    const int firstCol = visible.left() - bodyRect.left();
+    const int colCount = visible.width();
+
+    const double midY = bodyRect.center().y() + 0.5;
+    const double maxHalf = bodyRect.height() / 2.0 - 2.0;
+    if (maxHalf < 1.0) return;
+
+    QVector<float> peakCol(colCount, 0.0f);
+    QVector<float> bodyCol(colCount, 0.0f);
+
+    for (int i = 0; i < colCount; ++i) {
+        const double from = windowStart + (firstCol + i) * bucketsPerPx;
+        const double to = from + bucketsPerPx;
+
+        if (bucketsPerPx < 1.0) {
+            // Zoomed in past the data's own resolution. Interpolating between
+            // neighbouring buckets keeps the outline a curve — sampling the
+            // nearest one is precisely what drew flat-topped blocks several
+            // pixels wide.
+            const double at = std::clamp((from + to) * 0.5, 0.0,
+                                         static_cast<double>(bucketCount - 1));
+            const int i0 = static_cast<int>(at);
+            const int i1 = std::min(i0 + 1, bucketCount - 1);
+            const float f = static_cast<float>(at - i0);
+            peakCol[i] = peaks[i0] + (peaks[i1] - peaks[i0]) * f;
+            bodyCol[i] = hasRms ? rms[i0] + (rms[i1] - rms[i0]) * f
+                                : peakCol[i] * 0.55f;
+            continue;
+        }
+
+        // Zoomed out: every bucket under this column contributes. They combine
+        // differently on purpose — peaks by MAX, so a brief transient can't
+        // vanish just for being brief, and the body by energy mean, which is
+        // what RMS means. Taking the max of both would draw one envelope twice.
+        const int i0 = std::clamp(static_cast<int>(from), 0, bucketCount - 1);
+        const int i1 = std::clamp(static_cast<int>(std::ceil(to)), i0 + 1, bucketCount);
+
+        // At extreme zoom-out a single column can span minutes of audio. Reading
+        // every bucket there costs far more than it shows, so sample a bounded
+        // number of them — one column is already thousands of buckets wide.
+        const int stride = std::max(1, (i1 - i0) / 64);
+        float peak = 0.0f;
+        double energy = 0.0;
+        int sampled = 0;
+        for (int k = i0; k < i1; k += stride) {
+            peak = std::max(peak, peaks[k]);
+            if (hasRms) energy += static_cast<double>(rms[k]) * rms[k];
+            ++sampled;
+        }
+        peakCol[i] = peak;
+        bodyCol[i] = hasRms ? static_cast<float>(std::sqrt(energy / std::max(1, sampled)))
+                            : peak * 0.55f;
     }
 
-    const int totalPeaks = clip.waveformPeaks.size();
-    const double fraction = 1.0 / clip.waveformSourceDurationSec;
-    int startIdx = static_cast<int>(clip.sourceInSec * fraction * totalPeaks);
-    int endIdx = static_cast<int>(clip.sourceOutSec * fraction * totalPeaks);
-    startIdx = std::clamp(startIdx, 0, totalPeaks - 1);
-    endIdx = std::clamp(endIdx, startIdx + 1, totalPeaks);
-    const int sliceLen = endIdx - startIdx;
-    if (sliceLen <= 0 || bodyRect.width() <= 0) return;
+    // Both envelopes are mirrored about the axis. Real audio isn't symmetric,
+    // but the stored data is already an absolute magnitude, so drawing it both
+    // ways is honest about what was measured rather than inventing a shape for
+    // the lower half.
+    const double x0 = visible.left() + 0.5;
+    auto envelope = [&](const QVector<float>& col, double minHalfPx) {
+        QPainterPath path;
+        const auto halfAt = [&](int i) {
+            return std::max(minHalfPx, static_cast<double>(col[i]) * maxHalf);
+        };
+        path.moveTo(x0, midY - halfAt(0));
+        for (int i = 1; i < colCount; ++i) path.lineTo(x0 + i, midY - halfAt(i));
+        for (int i = colCount - 1; i >= 0; --i) path.lineTo(x0 + i, midY + halfAt(i));
+        path.closeSubpath();
+        return path;
+    };
+
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
 
     // Waveform sits ON the clip body in a light tint of the clip's own hue
     // rather than a fixed mint green, so a hue-rotated "Audio 3" reads as a
     // coherent object instead of a green waveform stuck on a teal clip.
-    QColor waveColor = tint.lighter(165);
-    waveColor.setAlpha(215);
-    p.setPen(waveColor);
-    const int midY = bodyRect.center().y();
-    const int maxBarHeight = bodyRect.height() / 2 - 2;
+    QColor axisColor = tint.lighter(150);
+    axisColor.setAlpha(85);
+    QColor peakFill = tint.lighter(170);
+    peakFill.setAlpha(115);
+    QColor peakEdge = tint.lighter(200);
+    peakEdge.setAlpha(150);
+    QColor bodyFill = tint.lighter(185);
+    bodyFill.setAlpha(245);
 
-    for (int x = 0; x < bodyRect.width(); ++x) {
-        const int peakIdx = startIdx + (x * sliceLen) / bodyRect.width();
-        const float peak = clip.waveformPeaks[std::clamp(peakIdx, startIdx, endIdx - 1)];
-        const int barHalfHeight = static_cast<int>(peak * maxBarHeight);
-        if (barHalfHeight <= 0) continue;
-        const int screenX = bodyRect.left() + x;
-        p.drawLine(screenX, midY - barHalfHeight, screenX, midY + barHalfHeight);
-    }
+    // Axis first, so it shows through silence instead of being covered by it.
+    p.setPen(QPen(axisColor, 1.0));
+    p.drawLine(QPointF(visible.left(), midY), QPointF(visible.right() + 1, midY));
+
+    // The peak envelope carries a half-pixel floor so silence draws as a thin
+    // continuous ribbon rather than breaking the waveform into disconnected
+    // islands wherever the audio drops out.
+    const QPainterPath peakPath = envelope(peakCol, 0.6);
+    p.setPen(Qt::NoPen);
+    p.setBrush(peakFill);
+    p.drawPath(peakPath);
+
+    p.setBrush(bodyFill);
+    p.drawPath(envelope(bodyCol, 0.0));
+
+    // A hairline along the peak outline. Fills alone go muddy where the
+    // envelope is busy; the edge is what keeps the shape readable there.
+    p.setBrush(Qt::NoBrush);
+    p.setPen(QPen(peakEdge, 0.9));
+    p.drawPath(peakPath);
+
+    p.restore();
 }
 
 // Draws a clip's video filmstrip inside its body rect, using the same
@@ -286,7 +404,7 @@ void drawTimePill(QPainter& p, const QRect& rect, const QString& label,
 }
 } // namespace
 
-void Timeline::paintEvent(QPaintEvent*) {
+void Timeline::paintEvent(QPaintEvent* event) {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setRenderHint(QPainter::SmoothPixmapTransform, true);
@@ -306,11 +424,25 @@ void Timeline::paintEvent(QPaintEvent*) {
     // Drawn before the ruler so the ruler's bottom border reads as the seam
     // between the two, and before the grid so the grid sits on top of the lane
     // wash rather than under it.
+    // Which lanes the clips being dragged are currently sitting in. During a
+    // cross-track move the clips themselves have already jumped, but at small
+    // clip widths that's easy to miss, so the destination lane is washed to
+    // make the target unmistakable while the button is still down.
+    QSet<int> activeDropLanes;
+    if (m_drag.mode == DragMode::MoveClip && m_drag.laneOffset != 0) {
+        for (const DragClipSnapshot& mc : m_drag.movingClips) activeDropLanes.insert(mc.trackIndex);
+    }
+
     int y = kRulerHeight;
     for (int trackIndex = 0; trackIndex < m_project->tracks.size(); ++trackIndex) {
         const Track& track = m_project->tracks[trackIndex];
         const int trackHeight = effectiveTrackHeight(track);
         p.fillRect(0, y, width(), trackHeight, trackLaneColor(track.type, track.colorIndex));
+        if (activeDropLanes.contains(trackIndex)) {
+            QColor dropWash = Theme::accent();
+            dropWash.setAlpha(28);
+            p.fillRect(0, y, width(), trackHeight, dropWash);
+        }
         y += trackHeight;
     }
     const int contentBottom = y;
@@ -384,7 +516,11 @@ void Timeline::paintEvent(QPaintEvent*) {
             p.fillRect(headerRect, palette.headerColor);
 
             if (track.type == TrackType::Audio) {
-                drawWaveform(p, bodyRect, clip, palette.accent);
+                // event->rect(), not rect(): this widget is as wide as the
+                // whole project inside its scroll area, so its own rect is no
+                // bound at all. The exposed rect is the part actually being
+                // repainted, which is what the waveform should cost.
+                drawWaveform(p, bodyRect, event->rect(), clip, palette.accent);
             } else if (track.type == TrackType::Video) {
                 drawThumbnails(p, bodyRect, clip);
 
@@ -900,6 +1036,106 @@ QVector<double> Timeline::collectSnapTargets(const QSet<qint64>& excludeKeys) co
     return targets;
 }
 
+int Timeline::sameTypeOrdinal(int trackIndex) const {
+    if (!m_project || trackIndex < 0 || trackIndex >= m_project->tracks.size()) return -1;
+    const TrackType type = m_project->tracks[trackIndex].type;
+    int ordinal = 0;
+    for (int i = 0; i < trackIndex; ++i) {
+        if (m_project->tracks[i].type == type) ++ordinal;
+    }
+    return ordinal;
+}
+
+int Timeline::trackForSameTypeOrdinal(TrackType type, int ordinal) const {
+    if (!m_project || ordinal < 0) return -1;
+    int seen = 0;
+    for (int i = 0; i < m_project->tracks.size(); ++i) {
+        if (m_project->tracks[i].type != type) continue;
+        if (seen == ordinal) return i;
+        ++seen;
+    }
+    return -1; // dragged past the last lane of this kind
+}
+
+bool Timeline::canMoveDraggedClipsToLane(int laneOffset) const {
+    if (!m_project || m_drag.movingClips.isEmpty()) return false;
+    for (const auto& mc : m_drag.movingClips) {
+        if (mc.startTrackIndex < 0 || mc.startTrackIndex >= m_project->tracks.size()) return false;
+        const TrackType type = m_project->tracks[mc.startTrackIndex].type;
+        const int destOrdinal = sameTypeOrdinal(mc.startTrackIndex) + laneOffset;
+        if (trackForSameTypeOrdinal(type, destOrdinal) < 0) return false;
+    }
+    return true;
+}
+
+void Timeline::moveDraggedClipsToLane(int laneOffset) {
+    if (!m_project || laneOffset == m_drag.laneOffset) return;
+    if (!canMoveDraggedClipsToLane(laneOffset)) return;
+
+    // Every dragged clip is LIFTED OUT first, then all of them are put back.
+    // Two passes rather than one, because removing a clip shifts the index of
+    // every clip after it on that track: interleaving removals with insertions
+    // would leave the rest of the group's snapshots pointing at their
+    // neighbours instead of themselves, and the group would come apart.
+    struct Lifted {
+        Clip clip;
+        int destTrackIndex = -1;
+        int snapshotIndex = -1;
+    };
+    QVector<Lifted> lifted;
+    lifted.reserve(m_drag.movingClips.size());
+
+    // Lift in descending clip order within each track, so a removal can only
+    // ever shift clips that have already been lifted.
+    QVector<int> liftOrder;
+    for (int i = 0; i < m_drag.movingClips.size(); ++i) liftOrder.push_back(i);
+    std::sort(liftOrder.begin(), liftOrder.end(), [this](int a, int b) {
+        const DragClipSnapshot& x = m_drag.movingClips[a];
+        const DragClipSnapshot& y = m_drag.movingClips[b];
+        if (x.trackIndex != y.trackIndex) return x.trackIndex < y.trackIndex;
+        return x.clipIndex > y.clipIndex;
+    });
+
+    for (int i : liftOrder) {
+        const DragClipSnapshot& mc = m_drag.movingClips[i];
+        if (mc.trackIndex < 0 || mc.trackIndex >= m_project->tracks.size()) continue;
+        auto& sourceClips = m_project->tracks[mc.trackIndex].clips;
+        if (mc.clipIndex < 0 || mc.clipIndex >= sourceClips.size()) continue;
+
+        const TrackType type = m_project->tracks[mc.startTrackIndex].type;
+        const int dest = trackForSameTypeOrdinal(type, sameTypeOrdinal(mc.startTrackIndex) + laneOffset);
+        if (dest < 0) continue; // already ruled out above, but never index on an assumption
+
+        lifted.push_back({sourceClips[mc.clipIndex], dest, i});
+        sourceClips.removeAt(mc.clipIndex);
+    }
+
+    for (const Lifted& item : lifted) {
+        auto& destClips = m_project->tracks[item.destTrackIndex].clips;
+        destClips.push_back(item.clip);
+        DragClipSnapshot& mc = m_drag.movingClips[item.snapshotIndex];
+        mc.trackIndex = item.destTrackIndex;
+        mc.clipIndex = destClips.size() - 1;
+    }
+
+    m_drag.laneOffset = laneOffset;
+
+    // Selection keys encode (track, clip), so all of them are now stale. They
+    // have to be rewritten here rather than on release: mousePressEvent built
+    // movingClips FROM the selection, and the paint pass reads it to decide
+    // what's highlighted, so a stale set would both un-highlight the group
+    // mid-drag and leave the wrong clips selected afterwards.
+    m_selectedClipKeys.clear();
+    for (const DragClipSnapshot& mc : m_drag.movingClips) {
+        m_selectedClipKeys.insert(clipKey(mc.trackIndex, mc.clipIndex));
+    }
+    if (m_drag.primarySnapshotIndex >= 0 && m_drag.primarySnapshotIndex < m_drag.movingClips.size()) {
+        const DragClipSnapshot& primary = m_drag.movingClips[m_drag.primarySnapshotIndex];
+        m_drag.primaryTrackIndex = primary.trackIndex;
+        m_drag.primaryClipIndex = primary.clipIndex;
+    }
+}
+
 void Timeline::updateCursorForPosition(const QPoint& pos) {
     if (!m_project || pos.y() < kRulerHeight) {
         // A pointing hand over a pin's flag is the only signal that it's a
@@ -992,6 +1228,9 @@ void Timeline::mousePressEvent(QMouseEvent* event) {
     m_drag.mode = dragModeAt(event->pos(), hit.trackIndex, hit.clipIndex);
     m_drag.primaryTrackIndex = hit.trackIndex;
     m_drag.primaryClipIndex = hit.clipIndex;
+    m_drag.primaryStartTrackIndex = hit.trackIndex;
+    m_drag.primarySnapshotIndex = -1;
+    m_drag.laneOffset = 0;
     m_drag.startMousePos = event->pos();
     m_drag.startSourceInSec = clip.sourceInSec;
     m_drag.startSourceOutSec = clip.sourceOutSec;
@@ -1005,10 +1244,14 @@ void Timeline::mousePressEvent(QMouseEvent* event) {
             const int t = static_cast<int>(k >> 32);
             const int c = static_cast<int>(k & 0xffffffffLL);
             if (t >= 0 && t < m_project->tracks.size() && c >= 0 && c < m_project->tracks[t].clips.size()) {
-                m_drag.movingClips.push_back({t, c, m_project->tracks[t].clips[c].trackPosSec});
+                if (t == hit.trackIndex && c == hit.clipIndex) {
+                    m_drag.primarySnapshotIndex = m_drag.movingClips.size();
+                }
+                m_drag.movingClips.push_back({t, t, c, m_project->tracks[t].clips[c].trackPosSec});
             }
         }
         excludeKeys = m_selectedClipKeys; // don't snap the group against its own members
+        setCursor(Qt::ClosedHandCursor);
     } else {
         excludeKeys.insert(key); // trimming only ever affects the primary clip
     }
@@ -1050,20 +1293,36 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
 
     const double deltaSec = xToSec(event->pos().x()) - xToSec(m_drag.startMousePos.x());
     const double snapThresholdSec = kSnapThresholdPx / m_pxPerSec;
-    Clip& primaryClip = m_project->tracks[m_drag.primaryTrackIndex].clips[m_drag.primaryClipIndex];
     m_activeSnapSec = -1.0;
 
     if (m_drag.mode == DragMode::MoveClip) {
+        // --- Vertical: cross into another lane of the same kind -------------
+        // Applied BEFORE the horizontal maths below, because relocating rewrites
+        // the indices that the horizontal pass writes through.
+        const int hoveredTrack = trackIndexAtY(event->pos().y());
+        if (hoveredTrack >= 0 && m_drag.primaryStartTrackIndex >= 0
+            && m_drag.primaryStartTrackIndex < m_project->tracks.size()) {
+            const TrackType grabbedType = m_project->tracks[m_drag.primaryStartTrackIndex].type;
+            // Only lanes of the clip's own kind are targets. Video on an audio
+            // track would decode nothing and render nothing, so hovering a
+            // mismatched lane simply leaves the group in the lane it's already
+            // in — a quiet no-op reads better here than snapping somewhere the
+            // clip can't work.
+            if (m_project->tracks[hoveredTrack].type == grabbedType) {
+                const int wanted = sameTypeOrdinal(hoveredTrack)
+                                 - sameTypeOrdinal(m_drag.primaryStartTrackIndex);
+                moveDraggedClipsToLane(wanted); // no-ops if unchanged or out of range
+            }
+        }
+
         // Find the primary clip's own starting position within the group
         // snapshot, so the delta/snap math below is computed relative to
         // the clip actually grabbed — then the SAME final delta is applied
         // to every other clip in the group, preserving their spacing.
         double primaryStartTrackPosSec = 0.0;
-        for (const auto& mc : m_drag.movingClips) {
-            if (mc.trackIndex == m_drag.primaryTrackIndex && mc.clipIndex == m_drag.primaryClipIndex) {
-                primaryStartTrackPosSec = mc.startTrackPosSec;
-                break;
-            }
+        if (m_drag.primarySnapshotIndex >= 0
+            && m_drag.primarySnapshotIndex < m_drag.movingClips.size()) {
+            primaryStartTrackPosSec = m_drag.movingClips[m_drag.primarySnapshotIndex].startTrackPosSec;
         }
 
         const double duration = m_drag.startSourceOutSec - m_drag.startSourceInSec;
@@ -1104,6 +1363,7 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
         }
 
     } else if (m_drag.mode == DragMode::TrimLeft) {
+        Clip& primaryClip = m_project->tracks[m_drag.primaryTrackIndex].clips[m_drag.primaryClipIndex];
         const double startTrackPosSec = primaryClip.trackPosSec + (m_drag.startSourceInSec - primaryClip.sourceInSec);
         double newIn = std::clamp(m_drag.startSourceInSec + deltaSec, 0.0,
                                    m_drag.startSourceOutSec - kMinClipLenSec);
@@ -1126,6 +1386,7 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
         primaryClip.trackPosSec = std::max(0.0, newTrackPos);
 
     } else if (m_drag.mode == DragMode::TrimRight) {
+        Clip& primaryClip = m_project->tracks[m_drag.primaryTrackIndex].clips[m_drag.primaryClipIndex];
         // Cap at the source file's own length if known (from whichever of
         // waveform/thumbnail metadata is present); otherwise allow generous
         // growth rather than blocking the gesture entirely.
@@ -1155,10 +1416,18 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
     update();
 }
 
-void Timeline::mouseReleaseEvent(QMouseEvent*) {
+void Timeline::mouseReleaseEvent(QMouseEvent* event) {
+    // Announce a cross-track move ONCE, here, rather than per lane crossing —
+    // the listener reloads media in response, which is too heavy to run every
+    // lane the pointer sweeps past on the way to the intended one.
+    const bool changedLane = m_drag.mode == DragMode::MoveClip && m_drag.laneOffset != 0;
+
     m_drag = DragState{};
     m_activeSnapSec = -1.0;
+    updateCursorForPosition(event->pos()); // back to open-hand/arrow now the grab is over
     update();
+
+    if (changedLane) emit clipsMovedBetweenTracks();
 }
 
 void Timeline::leaveEvent(QEvent*) {

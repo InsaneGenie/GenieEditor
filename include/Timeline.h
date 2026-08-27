@@ -119,6 +119,17 @@ signals:
     // this carries no specific clip identity.
     void clipDeleted();
 
+    // Fired once, on release, when a move gesture ended with clips in a
+    // DIFFERENT track than they started in. MainWindow re-syncs playback off
+    // this for the same reason it does on delete: an audio clip that changed
+    // track is now owned by a different AudioPlayer, and a video clip that
+    // changed track may have changed which layer wins at the playhead.
+    //
+    // Deliberately not emitted per lane crossing during the drag — resyncing
+    // reloads media into the players, and doing that on every lane the pointer
+    // passes through would stutter the gesture for no benefit.
+    void clipsMovedBetweenTracks();
+
     // Emitted after this widget has already added or removed a pin in the
     // Project — same "act directly, then announce" pattern the clip edits use.
     void markersChanged();
@@ -144,7 +155,16 @@ private:
     // One clip's starting position, snapshotted at drag-start, for group
     // moves — every selected clip gets one of these so the whole group can
     // be shifted by the same final (post-snap) delta together.
+    //
+    // The track is recorded TWICE because a move can now cross lanes.
+    // `startTrackIndex` is the anchor the vertical offset is measured from and
+    // never changes for the life of the drag; `trackIndex`/`clipIndex` are
+    // where the clip currently lives and are rewritten every time the gesture
+    // crosses into a new lane. Deriving the offset from the live index instead
+    // would make it self-referential — each crossing would move the anchor it
+    // was measured against, so the clip would walk away under the pointer.
     struct DragClipSnapshot {
+        int startTrackIndex = -1;
         int trackIndex = -1;
         int clipIndex = -1;
         double startTrackPosSec = 0.0;
@@ -154,6 +174,14 @@ private:
         DragMode mode = DragMode::None;
         int primaryTrackIndex = -1; // the clip actually grabbed — used for trim, and as the snap reference
         int primaryClipIndex = -1;
+        int primaryStartTrackIndex = -1; // the lane it was grabbed FROM; the vertical anchor
+        // Which entry of movingClips is the primary. Identity by position in
+        // the snapshot list rather than by (track, clip) pair, because that
+        // pair is exactly what changes when the group crosses a lane.
+        int primarySnapshotIndex = -1;
+        // How many lanes OF THE CLIP'S OWN TYPE the group currently sits from
+        // where it started. 0 for a purely horizontal move.
+        int laneOffset = 0;
         QPoint startMousePos;
         double startSourceInSec = 0.0;  // trim only ever affects the primary clip
         double startSourceOutSec = 0.0;
@@ -178,6 +206,30 @@ private:
     int secToX(double sec) const;
     DragMode dragModeAt(const QPoint& pos, int trackIndex, int clipIndex) const;
     QVector<double> collectSnapTargets(const QSet<qint64>& excludeKeys) const;
+
+    // --- Vertical (cross-track) moves --------------------------------------
+    // Lanes are counted WITHIN a type, not by raw track index, because tracks
+    // are stored in creation order and types interleave: the default project is
+    // Video 1 / Audio 1 / Audio 2, and adding a second video track appends it
+    // after the audio ones. A raw index delta of +1 from Video 1 would land on
+    // Audio 1, which is meaningless. Counting "the Nth video track" instead
+    // makes dragging down from Video 1 go to Video 2 wherever it happens to sit
+    // in the vector, and makes a mixed selection move each clip within its own
+    // kind — the behaviour Premiere has and the one people expect.
+
+    // How many tracks of the same type precede this one. -1 if out of range.
+    int sameTypeOrdinal(int trackIndex) const;
+    // The track index of the `ordinal`-th track of `type`, or -1 if there
+    // isn't one — which is what stops a drag past the last lane.
+    int trackForSameTypeOrdinal(TrackType type, int ordinal) const;
+    // True only if EVERY clip in the current move has a destination lane at
+    // this offset. All-or-nothing on purpose: letting part of a group move
+    // while the rest stays put silently destroys the relative arrangement the
+    // group was selected for.
+    bool canMoveDraggedClipsToLane(int laneOffset) const;
+    // Performs the relocation and repairs every index that depended on the old
+    // positions. Safe to call with the current offset (does nothing).
+    void moveDraggedClipsToLane(int laneOffset);
     void updateCursorForPosition(const QPoint& pos);
     void deleteClip(int trackIndex, int clipIndex);
     void deleteSelectedClips();
