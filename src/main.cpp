@@ -1,7 +1,8 @@
 #include <QApplication>
 #include "MainWindow.h"
 #include "Theme.h"
-
+#include <QSslSocket>
+#include <QDebug>
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
 
@@ -16,7 +17,11 @@ int main(int argc, char** argv) {
     // widgets snapshot the palette at construction time, so a theme applied
     // afterwards leaves anything already built looking like the old default.
     Theme::apply(app);
-
+    
+    qDebug() << "supportsSsl :" << QSslSocket::supportsSsl();
+    qDebug() << "build ver   :" << QSslSocket::sslLibraryBuildVersionString();
+    qDebug() << "runtime ver :" << QSslSocket::sslLibraryVersionString();
+    qDebug() << "exe dir     :" << QCoreApplication::applicationDirPath();
     MainWindow window;
     window.show();
 

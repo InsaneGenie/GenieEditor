@@ -111,6 +111,24 @@ target_link_libraries(VideoEditor PRIVATE
     PkgConfig::MPV
 )
 
+# --- Windows: copy Qt plugins next to the exe -------------------------------
+# vcpkg doesn't ship windeployqt, so the plugins Qt loads at runtime have to be
+# placed manually. Without these the app builds and launches fine but silently
+# loses features: no `tls` means HTTPS fails, no `imageformats` means GIF and
+# WebP previews come back blank.
+if(WIN32)
+    set(QT_PLUGIN_ROOT "C:/Users/steve/vcpkg/installed/x64-windows/debug/Qt6/plugins")
+    foreach(PLUGIN_DIR platforms imageformats tls styles)
+        if(EXISTS "${QT_PLUGIN_ROOT}/${PLUGIN_DIR}")
+            add_custom_command(TARGET VideoEditor POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${QT_PLUGIN_ROOT}/${PLUGIN_DIR}"
+                    "$<TARGET_FILE_DIR:VideoEditor>/${PLUGIN_DIR}"
+                COMMENT "Copying Qt ${PLUGIN_DIR} plugins")
+        endif()
+    endforeach()
+endif()
+
 if(FFMPEG_FOUND)
     target_link_libraries(VideoEditor PRIVATE PkgConfig::FFMPEG)
 endif()
