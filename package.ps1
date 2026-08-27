@@ -230,6 +230,29 @@ if ($crtDlls) {
     Write-Warning "on your download page."
 }
 
+# The itch.io app scans a package for executables and offers every one it finds
+# as something to launch -- so the bundled ffmpeg.exe appears alongside the
+# editor, and being the larger file it sorts first. A manifest names the single
+# real entry point and the picker disappears.
+#
+# The leading dot matters: the app looks for exactly ".itch.toml" in the root of
+# the extracted folder.
+Write-Host "`n=== 3e/5  itch.io manifest ===" -ForegroundColor Cyan
+$manifest = @'
+# Tells the itch.io app what to launch. Without this it finds the bundled
+# ffmpeg.exe as well and asks the user to choose, which is confusing and easy
+# to get wrong.
+[[actions]]
+name = "play"
+path = "GenieEditor.exe"
+'@
+$manifestPath = Join-Path $Staging ".itch.toml"
+# Written without a BOM: the app's TOML parser treats a leading byte-order mark
+# as part of the first key and fails to find the actions table.
+[System.IO.File]::WriteAllText($manifestPath, $manifest.Replace("`r`n", "`n"),
+                               (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "  wrote .itch.toml pointing at GenieEditor.exe"
+
 Write-Host "`n=== 4/5  Licences and docs ===" -ForegroundColor Cyan
 foreach ($f in @("LICENSE", "THIRD-PARTY.md", "README.md")) {
     $src = Join-Path $Root $f
@@ -300,7 +323,9 @@ $required = @("GenieEditor.exe", "libmpv-2.dll", "Qt6Core.dll", "Qt6Widgets.dll"
               # HTTPS needs all three. Missing any one degrades quietly to a
               # TLS backend that cannot connect, rather than failing loudly.
               "libssl-3-x64.dll", "libcrypto-3-x64.dll",
-              "tls\qopensslbackend.dll")
+              "tls\qopensslbackend.dll",
+              # Without this the itch app asks the user which exe to run.
+              ".itch.toml")
 # @() forces an array. Where-Object returns a bare string when exactly one item
 # matches, and += on a string concatenates rather than appends -- which is why
 # the previous run reported "libmpv-2.dllplatforms\qwindows.dll" as one name.
@@ -317,7 +342,55 @@ Write-Host "  all required files present" -ForegroundColor Green
 Write-Host "`n=== 5/5  Zipping ===" -ForegroundColor Cyan
 $Zip = Join-Path $Root "dist\GenieEditor-$Version-win64.zip"
 if (Test-Path $Zip) { Remove-Item $Zip }
-Compress-Archive -Path $Staging -DestinationPath $Zip
+
+# Built entry by entry rather than with Compress-Archive.
+#
+# Compress-Archive writes entry paths using the platform separator, so on
+# Windows every path inside the zip contains backslashes. The ZIP specification
+# requires forward slashes. Most extractors tolerate it, but the itch.io app
+# uses a strict one that reports "zip: insecure file path" and refuses to
+# install -- a failure that only shows up for people installing through the app,
+# never for anyone testing a browser download.
+Add-Type -AssemblyName System.IO.Compression | Out-Null
+Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+
+$stagingRoot = (Resolve-Path $Staging).Path
+$folderName  = Split-Path $Staging -Leaf
+$zipStream = [System.IO.File]::Create($Zip)
+$archive = New-Object System.IO.Compression.ZipArchive(
+    $zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    # -Force so nothing with a hidden attribute is skipped. A leading dot does
+    # not hide a file on Windows, but .itch.toml is the one entry whose absence
+    # would be invisible until someone installed through the app.
+    foreach ($file in Get-ChildItem $Staging -Recurse -File -Force) {
+        $relative = $file.FullName.Substring($stagingRoot.Length).TrimStart('\', '/')
+        # The one line that matters: forward slashes, always.
+        $entryName = ($folderName + '/' + $relative) -replace '\\', '/'
+        $entry = $archive.CreateEntry($entryName,
+                                      [System.IO.Compression.CompressionLevel]::Optimal)
+        # Not $input / $output: $input is a PowerShell automatic variable, and
+        # reusing it works at script scope but breaks in a pipeline or function.
+        $inStream = [System.IO.File]::OpenRead($file.FullName)
+        $outStream = $entry.Open()
+        try { $inStream.CopyTo($outStream) } finally { $outStream.Dispose(); $inStream.Dispose() }
+    }
+} finally {
+    $archive.Dispose()
+    $zipStream.Dispose()
+}
+
+# Verified rather than assumed, because the symptom appears only in the itch
+# app and would otherwise be found by users rather than here.
+$check = [System.IO.Compression.ZipFile]::OpenRead($Zip)
+try {
+    $bad = @($check.Entries | Where-Object { $_.FullName -match '\\' })
+    if ($bad) {
+        $bad | Select-Object -First 3 | ForEach-Object { Write-Warning "BACKSLASH ENTRY: $($_.FullName)" }
+        throw "Zip contains backslash paths - the itch app would refuse to install this"
+    }
+    Write-Host "  $($check.Entries.Count) entries, all with forward-slash paths"
+} finally { $check.Dispose() }
 
 $sizeMb = [math]::Round((Get-Item $Zip).Length / 1MB, 1)
 Write-Host "`nDone: $Zip  ($sizeMb MB)" -ForegroundColor Green
