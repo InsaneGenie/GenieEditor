@@ -89,6 +89,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     restoreLayout();
 
+    // AFTER restoreLayout, which would otherwise reinstate a visible GIFs dock
+    // from a layout saved when a key was present.
+    applyKlipyDockVisibility();
+
     // Reopen whatever was open last time. This is what makes closing the app
     // and coming back feel like resuming rather than starting over — the panel
     // layout was already restored above, and the project is the other half of
@@ -484,6 +488,19 @@ void MainWindow::buildUi() {
                            | QDockWidget::DockWidgetClosable);
     tabifyDockWidget(m_mediaBrowserDock, m_klipyDock);
 
+    // The GIFs dock stays hidden until a Klipy API key exists. Klipy requires a
+    // key per user and none can be shipped, so for anyone who hasn't got one the
+    // tab could only ever show a "set an API key" button -- which reads as a
+    // broken feature rather than an optional one. It reappears the moment a key
+    // is entered, and can be opened deliberately from the View menu before then.
+    connect(m_klipyPanel, &KlipyPanel::apiKeyStateChanged, this, [this](bool hasKey) {
+        if (hasKey && !m_klipyDock->isVisible()) {
+            m_klipyDock->show();
+            m_klipyDock->raise(); // it is tabbed, so showing alone would leave it behind another tab
+        }
+        updateKlipyMenuHint();
+    });
+
     // --- Sound effects ---------------------------------------------------
     m_soundEffectsPanel = new SoundEffectsPanel();
     connect(m_soundEffectsPanel, &SoundEffectsPanel::soundReady, this, [this](const QString& path) {
@@ -687,7 +704,8 @@ void MainWindow::buildMenus() {
     viewMenu->addAction(m_timelineDock->toggleViewAction());
     viewMenu->addAction(m_mediaBrowserDock->toggleViewAction());
     viewMenu->addAction(m_overlayDock->toggleViewAction());
-    viewMenu->addAction(m_klipyDock->toggleViewAction());
+    m_klipyViewAction = m_klipyDock->toggleViewAction();
+    viewMenu->addAction(m_klipyViewAction);
     viewMenu->addAction(m_soundEffectsDock->toggleViewAction());
     viewMenu->addSeparator();
     viewMenu->addAction("Reset panel layout", this, &MainWindow::resetLayout);
@@ -733,6 +751,11 @@ void MainWindow::resetLayout() {
     m_transcriptDock->raise();
     addDockWidget(Qt::BottomDockWidgetArea, m_timelineDock);
     applyDefaultLayout();
+
+    // Re-hide the GIFs dock if there's still no key. The loop above shows every
+    // dock deliberately -- that is the whole point of a layout reset -- but it
+    // must not undo the key gate and put a permanently empty tab back on screen.
+    applyKlipyDockVisibility();
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
@@ -2484,4 +2507,25 @@ void MainWindow::regenerateAllClipVisuals() {
             }
         }
     }
+}
+
+
+void MainWindow::applyKlipyDockVisibility() {
+    if (!m_klipyDock) return;
+
+    // Read from settings rather than asking the panel: this runs during startup,
+    // and the answer must not depend on whether the panel has finished wiring
+    // itself up yet.
+    const bool hasKey = !QSettings().value("klipy/apiKey").toString().trimmed().isEmpty();
+    if (!hasKey) m_klipyDock->hide();
+    updateKlipyMenuHint();
+}
+
+void MainWindow::updateKlipyMenuHint() {
+    if (!m_klipyViewAction) return;
+
+    const bool hasKey = !QSettings().value("klipy/apiKey").toString().trimmed().isEmpty();
+    // The menu entry says WHY it is empty, so someone who opens it out of
+    // curiosity understands the panel is waiting on a key rather than failing.
+    m_klipyViewAction->setText(hasKey ? "GIFs" : "GIFs (needs a free Klipy API key)");
 }

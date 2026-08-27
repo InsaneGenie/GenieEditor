@@ -206,6 +206,11 @@ private:
     void markProjectDirty();
     void updateWindowTitle();
 
+    // Hides the GIFs dock when no Klipy API key is set. Called after the saved
+    // layout is restored, since that can reinstate a dock the user can't use.
+    void applyKlipyDockVisibility();
+    void updateKlipyMenuHint();
+
     // Offers to save when something is about to discard unsaved work.
     // Returns false only if the user chose Cancel, meaning: don't proceed.
     bool confirmDiscardChanges();
@@ -363,6 +368,7 @@ private:
     QDockWidget* m_mediaBrowserDock = nullptr;
     QDockWidget* m_overlayDock = nullptr;
     QDockWidget* m_klipyDock = nullptr;
+    class QAction* m_klipyViewAction = nullptr;
     class SoundEffectsPanel* m_soundEffectsPanel = nullptr;
     QDockWidget* m_soundEffectsDock = nullptr;
 

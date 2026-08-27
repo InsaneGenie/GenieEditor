@@ -29,6 +29,12 @@ public:
     ~KlipyPanel() override;
 
 signals:
+    // Whether this panel currently has a usable API key. MainWindow keeps the
+    // GIFs dock hidden until it does -- an always-visible tab that can only ever
+    // say "set an API key" reads as a broken feature to everyone who has no
+    // intention of getting one.
+    void apiKeyStateChanged(bool hasKey);
+
     // A GIF finished downloading and is on disk at `localPath`, ready to import.
     void gifReady(const QString& localPath);
 

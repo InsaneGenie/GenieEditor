@@ -250,6 +250,7 @@ void KlipyPanel::setStatus(const QString& text, bool isError) {
 void KlipyPanel::updateApiKeyState() {
     const bool ready = m_client->hasApiKey();
     m_apiKeyButton->setVisible(!ready);
+    emit apiKeyStateChanged(ready);
     m_searchBox->setEnabled(ready);
     if (!ready) {
         setStatus("Searching KLIPY needs a free API key. Create one in the Klipy "
