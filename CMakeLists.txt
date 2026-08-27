@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(VideoEditor LANGUAGES CXX)
+project(GenieEditor LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,7 +58,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Sources
 # ---------------------------------------------------------------------------
-add_executable(VideoEditor
+add_executable(GenieEditor
     src/main.cpp
     src/Theme.cpp
     include/Theme.h
@@ -70,6 +70,8 @@ add_executable(VideoEditor
     include/Timeline.h
     src/Project.cpp
     include/Project.h
+    src/ProjectSerializer.cpp
+    include/ProjectSerializer.h
     src/FFmpegExporter.cpp
     include/FFmpegExporter.h
     src/Transcriber.cpp
@@ -88,6 +90,10 @@ add_executable(VideoEditor
     src/KlipyClient.cpp
     include/KlipyClient.h
     src/KlipyPanel.cpp
+    src/MyInstantsClient.cpp
+    include/MyInstantsClient.h
+    src/SoundEffectsPanel.cpp
+    include/SoundEffectsPanel.h
     include/KlipyPanel.h
     src/OverlayStageWidget.cpp
     include/OverlayStageWidget.h
@@ -101,9 +107,9 @@ add_executable(VideoEditor
     include/OverlayImageLoader.h
 )
 
-target_include_directories(VideoEditor PRIVATE include)
+target_include_directories(GenieEditor PRIVATE include)
 
-target_link_libraries(VideoEditor PRIVATE
+target_link_libraries(GenieEditor PRIVATE
     Qt6::Widgets
     Qt6::Multimedia
     Qt6::Concurrent
@@ -120,17 +126,64 @@ if(WIN32)
     set(QT_PLUGIN_ROOT "C:/Users/steve/vcpkg/installed/x64-windows/debug/Qt6/plugins")
     foreach(PLUGIN_DIR platforms imageformats tls styles)
         if(EXISTS "${QT_PLUGIN_ROOT}/${PLUGIN_DIR}")
-            add_custom_command(TARGET VideoEditor POST_BUILD
+            add_custom_command(TARGET GenieEditor POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_directory
                     "${QT_PLUGIN_ROOT}/${PLUGIN_DIR}"
-                    "$<TARGET_FILE_DIR:VideoEditor>/${PLUGIN_DIR}"
+                    "$<TARGET_FILE_DIR:GenieEditor>/${PLUGIN_DIR}"
                 COMMENT "Copying Qt ${PLUGIN_DIR} plugins")
         endif()
     endforeach()
 endif()
 
 if(FFMPEG_FOUND)
-    target_link_libraries(VideoEditor PRIVATE PkgConfig::FFMPEG)
+    target_link_libraries(GenieEditor PRIVATE PkgConfig::FFMPEG)
+endif()
+
+# ---------------------------------------------------------------------------
+# ffmpeg EXECUTABLE (needed at runtime by the exporter)
+#
+# Distinct from the FFmpeg libraries linked above, and easy to conflate: the
+# app links libavformat/libavcodec for probing, waveforms and thumbnails, but
+# FFmpegExporter drives the ffmpeg BINARY as a subprocess (see the rationale at
+# the top of FFmpegExporter.h). Linking the libraries successfully therefore
+# says nothing about whether the tool is present — which is exactly why the
+# "ffmpeg not found" dialog can appear on a build that compiled cleanly.
+#
+# vcpkg's ffmpeg port already builds the executable and installs it under
+# tools/ffmpeg, so on this setup it's almost certainly on disk already and just
+# never got copied next to the app. Copying it here mirrors what's done for the
+# Qt plugins above and makes the export work from a fresh clone without anyone
+# having to know any of the above.
+#
+# Not fatal when missing: the app runs fine without it, and everything except
+# export works. The exporter looks on PATH too, so a system install still gets
+# picked up at runtime.
+# ---------------------------------------------------------------------------
+find_program(FFMPEG_EXECUTABLE
+    NAMES ffmpeg
+    HINTS
+        "${_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/ffmpeg"
+        "${CMAKE_PREFIX_PATH}/tools/ffmpeg"
+        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/ffmpeg"
+    PATH_SUFFIXES tools/ffmpeg bin
+)
+
+if(FFMPEG_EXECUTABLE)
+    message(STATUS "ffmpeg executable found for export: ${FFMPEG_EXECUTABLE}")
+    add_custom_command(TARGET GenieEditor POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FFMPEG_EXECUTABLE}"
+            "$<TARGET_FILE_DIR:GenieEditor>"
+        COMMENT "Copying ffmpeg executable next to GenieEditor (needed for export)")
+else()
+    message(WARNING
+        "ffmpeg executable NOT found — everything works except EXPORT, which "
+        "will show an 'ffmpeg not found' dialog.\n"
+        "  Fix by either:\n"
+        "    * vcpkg install ffmpeg[core,x264]:x64-windows   (then reconfigure), or\n"
+        "    * download a build from https://www.gyan.dev/ffmpeg/builds/ and put "
+        "ffmpeg.exe next to GenieEditor.exe, or\n"
+        "    * pass -DFFMPEG_EXECUTABLE=C:/path/to/ffmpeg.exe to cmake.")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -240,7 +293,7 @@ FetchContent_Declare(
     GIT_TAG v1.7.2
 )
 FetchContent_MakeAvailable(whisper_cpp)
-target_link_libraries(VideoEditor PRIVATE whisper)
+target_link_libraries(GenieEditor PRIVATE whisper)
 
 # NOTE: no manual windeployqt step needed here — vcpkg's toolchain already
 # auto-copies all required Qt (and other) DLLs next to the built .exe via
@@ -252,7 +305,7 @@ target_link_libraries(VideoEditor PRIVATE whisper)
 # vcpkg's applocal-deps mechanism doesn't know about their DLLs (whisper.dll
 # and, depending on the ggml build, separate ggml*.dll files) — they'd
 # otherwise get built somewhere inside the build tree and never make it
-# next to VideoEditor.exe, causing a "whisper.dll was not found" error at
+# next to GenieEditor.exe, causing a "whisper.dll was not found" error at
 # launch. $<TARGET_RUNTIME_DLLS:...> (CMake 3.21+) is the modern, correct
 # fix for exactly this: it resolves to every DLL the target actually
 # depends on at runtime, transitively, without needing to know individual
@@ -262,9 +315,9 @@ target_link_libraries(VideoEditor PRIVATE whisper)
 # This also means enabling Vulkan above needs NO further changes here —
 # the additional ggml-vulkan.dll it produces gets picked up automatically
 # by the same generic mechanism.
-add_custom_command(TARGET VideoEditor POST_BUILD
+add_custom_command(TARGET GenieEditor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_RUNTIME_DLLS:VideoEditor>
-        $<TARGET_FILE_DIR:VideoEditor>
+        $<TARGET_RUNTIME_DLLS:GenieEditor>
+        $<TARGET_FILE_DIR:GenieEditor>
     COMMAND_EXPAND_LISTS
 )

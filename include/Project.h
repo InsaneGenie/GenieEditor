@@ -137,6 +137,19 @@ struct Clip {
     double trackPosSec  = 0.0;   // where this clip sits on the track timeline
     double gainDb       = 0.0;   // audio gain, ignored for video-only clips
 
+    // Playback rate. 1.0 is untouched; 4.0 plays four seconds of source in one
+    // second of timeline (a fast-forward); 0.5 is slow motion.
+    //
+    // This is the one field that breaks the assumption the rest of the codebase
+    // was built on — that source time and timeline time are the same thing.
+    // They are not once this isn't 1.0, and the distinction is now explicit
+    // everywhere it matters: sourceDurationSec() is how much of the FILE the
+    // clip covers, durationSec() is how much of the TIMELINE it occupies, and
+    // sourceTimeAt() converts between them. Anything that seeks, trims, splits,
+    // or exports has to go through those rather than subtracting positions
+    // directly.
+    double speed = 1.0;
+
     // Downsampled amplitude peaks covering the clip's ENTIRE original
     // source file (not just [sourceInSec, sourceOutSec]) — see
     // WaveformGenerator. Storing the full-file peaks rather than a
@@ -164,7 +177,39 @@ struct Clip {
     // Only meaningful for clips on an Overlay track; ignored everywhere else.
     OverlayAnimation anim;
 
-    double durationSec() const { return sourceOutSec - sourceInSec; }
+    // Rate limits. The floor is above zero because a clip at 0x occupies
+    // infinite timeline, and the ceiling is where mpv and ffmpeg both stop
+    // being well-behaved. Clamped on read rather than on write so a file
+    // hand-edited to something absurd still loads instead of hanging.
+    static constexpr double kMinSpeed = 0.05;
+    static constexpr double kMaxSpeed = 100.0;
+
+    double effectiveSpeed() const {
+        return speed < kMinSpeed ? kMinSpeed : (speed > kMaxSpeed ? kMaxSpeed : speed);
+    }
+
+    // How much of the SOURCE FILE this clip covers. Unaffected by speed —
+    // it's the trim window, and speeding a clip up doesn't change which part
+    // of the file it shows.
+    double sourceDurationSec() const { return sourceOutSec - sourceInSec; }
+
+    // How much of the TIMELINE this clip occupies. This is what layout, hit
+    // testing, snapping, project length and export windows all want, which is
+    // why it keeps the short name every existing caller already uses.
+    double durationSec() const { return sourceDurationSec() / effectiveSpeed(); }
+
+    // The moment in the source file that plays at a given moment on the
+    // timeline. The single conversion between the two time bases — seeking,
+    // splitting and trimming all route through it rather than each
+    // re-deriving the arithmetic and each getting it subtly wrong.
+    double sourceTimeAt(double timelineSec) const {
+        return sourceInSec + (timelineSec - trackPosSec) * effectiveSpeed();
+    }
+
+    // The inverse: where on the timeline a given moment of the source lands.
+    double timelineTimeAt(double sourceSec) const {
+        return trackPosSec + (sourceSec - sourceInSec) / effectiveSpeed();
+    }
 };
 
 // One transcript segment as produced by whisper.cpp, with word-level timing
@@ -286,6 +331,25 @@ struct Marker {
     // when it was created as a single point.
     bool isPin() const { return (endSec - startSec) < 0.0005; }
 };
+
+// One row of the transcript panel: a segment as it appears at one place on the
+// TIMELINE.
+//
+// Not one row per segment, because those aren't the same thing. A segment
+// describes a range of the SOURCE FILE, and one file can appear on a track more
+// than once — split a recording and both halves reference it, so a line can
+// genuinely be audible twice. Equally, a line inside a trimmed-away part is
+// audible zero times. Rows are therefore built by walking the CLIPS and asking
+// each which segments it plays, which is also what gives every row a real ruler
+// position instead of an offset within a file.
+struct TranscriptRow {
+    double timelineSec = 0.0; // where this line is heard, on the ruler
+    int segmentIndex = -1;    // into Track::transcript
+    int clipIndex = -1;       // the clip that plays it
+};
+
+// Rows for one track, in timeline order.
+QVector<TranscriptRow> buildTranscriptRows(const Track& track);
 
 class Project {
 public:

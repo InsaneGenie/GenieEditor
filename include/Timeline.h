@@ -4,6 +4,7 @@
 #include <QSet>
 #include <QPair>
 #include "Project.h"
+#include "TimelineMetrics.h"
 
 class QWheelEvent;
 class QMouseEvent;
@@ -43,6 +44,17 @@ public:
     void setPlayheadSec(double seconds);
     void setPixelsPerSecond(double pxPerSec);
     double pixelsPerSecond() const { return m_pxPerSec; }
+
+    // How far the enclosing scroll area has scrolled this widget vertically.
+    //
+    // The ruler and playhead needle are painted at this offset so they stay
+    // pinned to the top of the viewport while the tracks scroll underneath —
+    // the ruler is what every position on the timeline is read against, so
+    // losing it off the top loses the thing that makes the rest legible.
+    //
+    // The widget can't work this out for itself: it's the scrolled CHILD, and
+    // its own geometry says nothing about where the viewport currently sits.
+    void setVerticalScrollOffset(int px);
 
     // Drops a pin at the current playhead position. If a pin already sits there
     // it's removed instead, so the same key both places and clears one — and it
@@ -130,6 +142,21 @@ signals:
     // passes through would stutter the gesture for no benefit.
     void clipsMovedBetweenTracks();
 
+    // Emitted whenever this widget has changed the Project in ANY way — a clip
+    // moved, trimmed, split, deleted, or a pin added.
+    //
+    // Separate from the more specific signals above because it answers a
+    // different question. Those say "this particular thing happened, go re-sync
+    // playback"; this one only says "the project is no longer what was last
+    // saved". Without it, unsaved-changes tracking would miss drags and trims
+    // entirely, since those mutate Project directly and announce nothing.
+    void projectModified();
+
+    // A clip's playback rate changed. Distinct from projectModified because it
+    // needs an immediate response rather than just a dirty flag: clip durations
+    // just changed, and the players have to be told the new rate.
+    void clipSpeedChanged();
+
     // Emitted after this widget has already added or removed a pin in the
     // Project — same "act directly, then announce" pattern the clip edits use.
     void markersChanged();
@@ -200,6 +227,15 @@ private:
 
     // The clickable flag drawn in the ruler for a pin at `sec`.
     QRect pinHandleRect(double sec) const;
+
+    // The ruler band's current top/bottom in WIDGET coordinates, which move
+    // with the scroll offset. Every hit test that used to compare against
+    // kRulerHeight has to go through these instead: at a scroll offset of 300,
+    // widget y=310 is under the floating ruler even though it is nowhere near
+    // the top of the widget.
+    int rulerTopY() const { return m_scrollOffsetY; }
+    int rulerBottomY() const { return m_scrollOffsetY + TimelineMetrics::kRulerHeight; }
+    bool isRulerY(int y) const { return y >= rulerTopY() && y < rulerBottomY(); }
     // Index into Project::markers of the pin whose flag is under `pos`, or -1.
     int pinIndexAt(const QPoint& pos) const;
     double xToSec(int x) const;
@@ -230,6 +266,11 @@ private:
     // Performs the relocation and repairs every index that depended on the old
     // positions. Safe to call with the current offset (does nothing).
     void moveDraggedClipsToLane(int laneOffset);
+
+    // Applies a playback rate to every selected clip. Each clip keeps its own
+    // start position — a clip's start is where the user put it, and only its
+    // LENGTH follows from the rate.
+    void applySpeedToSelection(double speed);
     void updateCursorForPosition(const QPoint& pos);
     void deleteClip(int trackIndex, int clipIndex);
     void deleteSelectedClips();
@@ -237,6 +278,7 @@ private:
     Project* m_project = nullptr;
     double m_playheadSec = 0.0;
     double m_pxPerSec = 60.0; // zoom level
+    int m_scrollOffsetY = 0;  // see setVerticalScrollOffset
     QSet<qint64> m_selectedClipKeys;
 
     DragState m_drag;

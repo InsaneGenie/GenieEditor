@@ -34,6 +34,11 @@ public:
     // 0-100. Applies mpv's own "volume" property to this instance.
     void setVolume(int percent);
 
+    // Playback rate — see PlayerWidget::setSpeed. Audio is the half that
+    // matters here: mpv's pitch correction is what keeps a 2x clip sounding
+    // like speech rather than a chipmunk.
+    void setSpeed(double speed);
+
 signals:
     void positionChanged(double seconds);
     void fileLoaded(double durationSeconds);
@@ -47,4 +52,5 @@ private:
 
     mpv_handle* m_mpv = nullptr;
     int m_pollTimerId = 0;
+    double m_speed = 1.0; // last rate pushed to mpv; see setSpeed
 };

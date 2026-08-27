@@ -3,6 +3,7 @@
 #include "Theme.h"
 
 #include <QPainter>
+#include <QInputDialog>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QFontMetrics>
@@ -53,6 +54,13 @@ void Timeline::setProject(Project* project) {
 void Timeline::setPlayheadSec(double seconds) {
     m_playheadSec = seconds;
     update();
+}
+
+void Timeline::setVerticalScrollOffset(int px) {
+    const int clamped = std::max(0, px);
+    if (clamped == m_scrollOffsetY) return;
+    m_scrollOffsetY = clamped;
+    update(); // the ruler has to be repainted at its new resting place
 }
 
 void Timeline::setPixelsPerSecond(double pxPerSec) {
@@ -411,7 +419,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
     p.fillRect(rect(), Theme::bg0());
 
     if (!m_project) {
-        p.fillRect(0, 0, width(), kRulerHeight, Theme::bg2());
+        p.fillRect(0, rulerTopY(), width(), kRulerHeight, Theme::bg2());
         return;
     }
 
@@ -635,7 +643,13 @@ void Timeline::paintEvent(QPaintEvent* event) {
                 p.save();
                 p.setClipRect(headerRect);
                 const QString name = clip.sourcePath.section('/', -1).section('\\', -1);
-                const QString duration = formatTickLabel(clip.durationSec());
+                // A rate badge next to the duration. Without it a 4x clip is
+                // indistinguishable from a short one, and the reason the
+                // footage races is invisible until playback.
+                const QString rate = std::fabs(clip.effectiveSpeed() - 1.0) < 1e-9
+                    ? QString()
+                    : QString("%1\u00d7 ").arg(clip.effectiveSpeed(), 0, 'g', 3);
+                const QString duration = rate + formatTickLabel(clip.durationSec());
 
                 p.setFont(Theme::monoFont(-2));
                 const QFontMetrics durFm(p.font());
@@ -663,9 +677,19 @@ void Timeline::paintEvent(QPaintEvent* event) {
     // -------------------------------------------------------------------
     // Ruler
     // -------------------------------------------------------------------
-    p.fillRect(0, 0, width(), kRulerHeight, Theme::bg2());
+    // Painted at the scroll offset rather than at y=0, so it stays pinned to
+    // the top of the viewport while the tracks scroll beneath it. Drawn after
+    // the clips, so it covers whatever it now sits on top of.
+    //
+    // Below this point kRulerHeight is no longer a usable y-coordinate:
+    // rulerTop/rulerBottom are where the band ACTUALLY is. Anything that spans
+    // down into the tracks starts at rulerBottom so it doesn't paint over the
+    // ruler it is supposed to sit under.
+    const int rulerTop = rulerTopY();
+    const int rulerBottom = rulerBottomY();
+    p.fillRect(0, rulerTop, width(), kRulerHeight, Theme::bg2());
 
-    const int tickBottom = kRulerHeight - kMarkerBandHeight - 2;
+    const int tickBottom = rulerBottom - kMarkerBandHeight - 2;
 
     // Minor ticks first, so major ticks overdraw them cleanly.
     if (minorIntervalSec * m_pxPerSec >= 7.0) {
@@ -690,11 +714,11 @@ void Timeline::paintEvent(QPaintEvent* event) {
     p.setPen(Theme::textDim());
     for (double sec = 0; secToX(sec) < width(); sec += tickIntervalSec) {
         const int x = secToX(sec);
-        p.drawText(QRect(x + 5, 2, 90, 13), Qt::AlignLeft | Qt::AlignVCenter, formatTickLabel(sec));
+        p.drawText(QRect(x + 5, rulerTop + 2, 90, 13), Qt::AlignLeft | Qt::AlignVCenter, formatTickLabel(sec));
     }
 
     p.setPen(QPen(Theme::line(), 1));
-    p.drawLine(0, kRulerHeight - 1, width(), kRulerHeight - 1);
+    p.drawLine(0, rulerBottom - 1, width(), rulerBottom - 1);
 
     // Markers get their own slim band along the base of the ruler rather than
     // flooding its full height — at full height they swamped the ruler and, in
@@ -703,7 +727,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
         if (marker.isPin()) continue; // pins are drawn separately, below
         const int x1 = secToX(marker.startSec);
         const int x2 = secToX(marker.endSec);
-        const QRect band(x1, kRulerHeight - kMarkerBandHeight - 1,
+        const QRect band(x1, rulerBottom - kMarkerBandHeight - 1,
                          std::max(3, x2 - x1), kMarkerBandHeight);
         p.setPen(Qt::NoPen);
         p.setBrush(marker.color);
@@ -713,7 +737,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
         // a region highlight rather than an object.
         QColor wash = marker.color;
         wash.setAlpha(22);
-        p.fillRect(QRect(band.x(), kRulerHeight, band.width(), contentBottom - kRulerHeight), wash);
+        p.fillRect(QRect(band.x(), rulerBottom, band.width(), contentBottom - rulerBottom), wash);
     }
 
     // -------------------------------------------------------------------
@@ -736,12 +760,12 @@ void Timeline::paintEvent(QPaintEvent* event) {
         // to share its hue — an audio track hue-rotated toward cyan swallowed it
         // completely.
         p.setPen(QPen(QColor(0, 0, 0, 90), 1));
-        p.drawLine(x, kRulerHeight, x, contentBottom);
+        p.drawLine(x, rulerBottom, x, contentBottom);
 
         QColor guide = marker.color;
         guide.setAlpha(190);
         p.setPen(QPen(guide, 1, Qt::DashLine));
-        p.drawLine(x, kRulerHeight, x, contentBottom);
+        p.drawLine(x, rulerBottom, x, contentBottom);
 
         // Flag shape: a tag with a point at the bottom, planted on the instant.
         const QRect handle = pinHandleRect(marker.startSec);
@@ -777,9 +801,9 @@ void Timeline::paintEvent(QPaintEvent* event) {
         QColor glow = Theme::accent();
         glow.setAlpha(60);
         p.setPen(QPen(glow, 5));
-        p.drawLine(snapX, kRulerHeight, snapX, contentBottom);
+        p.drawLine(snapX, rulerBottom, snapX, contentBottom);
         p.setPen(QPen(Theme::accent(), 1.5));
-        p.drawLine(snapX, kRulerHeight, snapX, contentBottom);
+        p.drawLine(snapX, rulerBottom, snapX, contentBottom);
     }
 
     // Ruler hover scrub-preview: a guide line plus a floating time pill, shown
@@ -789,13 +813,13 @@ void Timeline::paintEvent(QPaintEvent* event) {
         QColor guide = Theme::text();
         guide.setAlpha(90);
         p.setPen(QPen(guide, 1, Qt::DashLine));
-        p.drawLine(hx, kRulerHeight, hx, contentBottom);
+        p.drawLine(hx, rulerBottom, hx, contentBottom);
 
         const QString label = formatTickLabel(m_hoverSec);
         const QFontMetrics fm(Theme::monoFont(-1, QFont::DemiBold));
         const int labelW = fm.horizontalAdvance(label) + 16;
         const int labelX = std::clamp(hx - labelW / 2, 2, std::max(2, width() - labelW - 2));
-        const QRect labelRect(labelX, 3, labelW, kRulerHeight - 11);
+        const QRect labelRect(labelX, rulerTop + 3, labelW, kRulerHeight - 11);
         drawTimePill(p, labelRect, label, Theme::bg4(), Theme::text(), labelRect.height() / 2.0);
     }
 
@@ -858,7 +882,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
                     int previewX = m_hoverPreviewMousePos.x() - kPreviewW / 2;
                     previewX = std::clamp(previewX, 6, std::max(6, width() - kPreviewW - 6));
                     int previewY = m_hoverPreviewMousePos.y() - kGapFromCursor - kPreviewH;
-                    if (previewY < kRulerHeight) {
+                    if (previewY < rulerBottom) {
                         previewY = m_hoverPreviewMousePos.y() + kGapFromCursor; // flip below rather than clip off-screen
                     }
 
@@ -905,35 +929,35 @@ void Timeline::paintEvent(QPaintEvent* event) {
     QColor playGlow = playColor;
     playGlow.setAlpha(45);
     p.setPen(QPen(playGlow, 5));
-    p.drawLine(playX, kRulerHeight, playX, contentBottom);
+    p.drawLine(playX, rulerBottom, playX, contentBottom);
 
     p.setPen(QPen(playColor, 1.4));
-    p.drawLine(playX, kRulerHeight - kMarkerBandHeight - 2, playX, contentBottom);
+    p.drawLine(playX, rulerBottom - kMarkerBandHeight - 2, playX, contentBottom);
 
     const QString playLabel = formatPlayheadTimecode(m_playheadSec);
     const QFontMetrics playFm(Theme::monoFont(-1, QFont::DemiBold));
     const int capsuleW = playFm.horizontalAdvance(playLabel) + 18;
     const int capsuleH = kRulerHeight - 11;
     const int capsuleX = std::clamp(playX - capsuleW / 2, 2, std::max(2, width() - capsuleW - 2));
-    const QRect capsule(capsuleX, 3, capsuleW, capsuleH);
+    const QRect capsule(capsuleX, rulerTop + 3, capsuleW, capsuleH);
     drawTimePill(p, capsule, playLabel, playColor, QColor(0x1A, 0x12, 0x02), capsuleH / 2.0);
 
     // A short stem joining the capsule to the needle, so the readout reads as
     // part of the playhead rather than a label that happens to be nearby.
     p.setPen(QPen(playColor, 1.4));
-    p.drawLine(playX, capsule.bottom(), playX, kRulerHeight);
+    p.drawLine(playX, capsule.bottom(), playX, rulerBottom);
 }
 
 QRect Timeline::pinHandleRect(double sec) const {
     // Sits in the ruler, its point resting on the marker band so the flag looks
     // like it's planted at the exact instant it represents.
     const int x = secToX(sec);
-    const int bottom = kRulerHeight - 1;
+    const int bottom = rulerBottomY() - 1;
     return QRect(x - kPinWidth / 2, bottom - kPinHeight, kPinWidth, kPinHeight);
 }
 
 int Timeline::pinIndexAt(const QPoint& pos) const {
-    if (!m_project || pos.y() >= kRulerHeight) return -1;
+    if (!m_project || !isRulerY(pos.y())) return -1;
 
     // Reverse order so the most recently added pin wins when two overlap at the
     // current zoom — that's the one the user just placed and is most likely
@@ -964,6 +988,7 @@ void Timeline::togglePinAtPlayhead() {
             m_project->markers.remove(i);
             update();
             emit markersChanged();
+            emit projectModified();
             return;
         }
     }
@@ -975,6 +1000,7 @@ void Timeline::togglePinAtPlayhead() {
     m_project->markers.push_back(pin);
     update();
     emit markersChanged();
+    emit projectModified();
 }
 
 int Timeline::trackIndexAtY(int y) const {
@@ -991,6 +1017,7 @@ int Timeline::trackIndexAtY(int y) const {
 Timeline::HitResult Timeline::hitTest(const QPoint& pos) const {
     HitResult result;
     if (!m_project || pos.y() < kRulerHeight) return result;
+    if (isRulerY(pos.y())) return result; // covered by the floating ruler
 
     const int trackIndex = trackIndexAtY(pos.y());
     if (trackIndex < 0) return result;
@@ -1137,7 +1164,7 @@ void Timeline::moveDraggedClipsToLane(int laneOffset) {
 }
 
 void Timeline::updateCursorForPosition(const QPoint& pos) {
-    if (!m_project || pos.y() < kRulerHeight) {
+    if (!m_project || isRulerY(pos.y())) {
         // A pointing hand over a pin's flag is the only signal that it's a
         // grabbable object rather than part of the ruler graphics.
         setCursor(pinIndexAt(pos) >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
@@ -1162,6 +1189,7 @@ void Timeline::mouseDoubleClickEvent(QMouseEvent* event) {
         m_project->markers.remove(pinIndex);
         update();
         emit markersChanged();
+        emit projectModified();
         return;
     }
     QWidget::mouseDoubleClickEvent(event);
@@ -1171,7 +1199,7 @@ void Timeline::mousePressEvent(QMouseEvent* event) {
     setFocus(Qt::MouseFocusReason); // so Delete/Backspace works immediately after clicking a clip
     m_hoverPreviewTrackIndex = -1; // don't leave the scrub-preview popup lingering during a drag
     m_hoverPreviewClipIndex = -1;
-    if (event->pos().y() < kRulerHeight) {
+    if (isRulerY(event->pos().y())) {
         // Clicking a pin seeks exactly to it rather than to wherever in the
         // pin's few pixels the click happened to land — the whole point of
         // dropping a pin is being able to get back to that precise instant.
@@ -1262,7 +1290,7 @@ void Timeline::mousePressEvent(QMouseEvent* event) {
 void Timeline::mouseMoveEvent(QMouseEvent* event) {
     // Ruler scrubbing (drag to seek) — unchanged behavior for the ruler band.
     if ((event->buttons() & Qt::LeftButton) && m_drag.mode == DragMode::None
-        && event->pos().y() < kRulerHeight) {
+        && isRulerY(event->pos().y())) {
         emit seekRequested(xToSec(event->pos().x()));
         return;
     }
@@ -1270,12 +1298,12 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
     // Idle hover: scrub-preview on the ruler, cursor feedback over clips,
     // and the frame-preview popup while hovering a video clip's body.
     if (event->buttons() == Qt::NoButton) {
-        m_hoverSec = (event->pos().y() < kRulerHeight) ? xToSec(event->pos().x()) : -1.0;
+        m_hoverSec = isRulerY(event->pos().y()) ? xToSec(event->pos().x()) : -1.0;
         updateCursorForPosition(event->pos());
 
         m_hoverPreviewTrackIndex = -1;
         m_hoverPreviewClipIndex = -1;
-        if (m_project && event->pos().y() >= kRulerHeight) {
+        if (m_project && !isRulerY(event->pos().y())) {
             const HitResult hit = hitTest(event->pos());
             if (hit.clipIndex >= 0 && m_project->tracks[hit.trackIndex].type == TrackType::Video) {
                 m_hoverPreviewTrackIndex = hit.trackIndex;
@@ -1364,10 +1392,15 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
 
     } else if (m_drag.mode == DragMode::TrimLeft) {
         Clip& primaryClip = m_project->tracks[m_drag.primaryTrackIndex].clips[m_drag.primaryClipIndex];
-        const double startTrackPosSec = primaryClip.trackPosSec + (m_drag.startSourceInSec - primaryClip.sourceInSec);
-        double newIn = std::clamp(m_drag.startSourceInSec + deltaSec, 0.0,
-                                   m_drag.startSourceOutSec - kMinClipLenSec);
-        double newTrackPos = startTrackPosSec + (newIn - m_drag.startSourceInSec);
+        // The pointer moves in TIMELINE seconds; in/out points are SOURCE
+        // seconds. On a 4x clip, dragging the handle one timeline second has to
+        // consume four seconds of source, or the edge won't track the cursor.
+        const double rate = primaryClip.effectiveSpeed();
+        const double startTrackPosSec =
+            primaryClip.trackPosSec + (m_drag.startSourceInSec - primaryClip.sourceInSec) / rate;
+        double newIn = std::clamp(m_drag.startSourceInSec + deltaSec * rate, 0.0,
+                                   m_drag.startSourceOutSec - kMinClipLenSec * rate);
+        double newTrackPos = startTrackPosSec + (newIn - m_drag.startSourceInSec) / rate;
 
         double bestDist = snapThresholdSec;
         bool snapped = false;
@@ -1377,9 +1410,9 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
             if (d <= bestDist) { bestDist = d; snappedPos = target; snapped = true; }
         }
         if (snapped) {
-            newIn = std::clamp(m_drag.startSourceInSec + (snappedPos - startTrackPosSec),
-                                0.0, m_drag.startSourceOutSec - kMinClipLenSec);
-            newTrackPos = startTrackPosSec + (newIn - m_drag.startSourceInSec);
+            newIn = std::clamp(m_drag.startSourceInSec + (snappedPos - startTrackPosSec) * rate,
+                                0.0, m_drag.startSourceOutSec - kMinClipLenSec * rate);
+            newTrackPos = startTrackPosSec + (newIn - m_drag.startSourceInSec) / rate;
             m_activeSnapSec = newTrackPos;
         }
         primaryClip.sourceInSec = newIn;
@@ -1392,10 +1425,11 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
         // growth rather than blocking the gesture entirely.
         const double sourceLimit = primaryClip.waveformSourceDurationSec > 0.0 ? primaryClip.waveformSourceDurationSec
                                   : (primaryClip.thumbnailSourceDurationSec > 0.0 ? primaryClip.thumbnailSourceDurationSec : 1e9);
+        const double rate = primaryClip.effectiveSpeed(); // see the note in TrimLeft
         const double startTrackPosSec = primaryClip.trackPosSec; // unchanged by right-trim
-        double newOut = std::clamp(m_drag.startSourceOutSec + deltaSec,
-                                    m_drag.startSourceInSec + kMinClipLenSec, sourceLimit);
-        const double newEndPos = startTrackPosSec + (newOut - m_drag.startSourceInSec);
+        double newOut = std::clamp(m_drag.startSourceOutSec + deltaSec * rate,
+                                    m_drag.startSourceInSec + kMinClipLenSec * rate, sourceLimit);
+        const double newEndPos = startTrackPosSec + (newOut - m_drag.startSourceInSec) / rate;
 
         double bestDist = snapThresholdSec;
         bool snapped = false;
@@ -1405,9 +1439,9 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
             if (d <= bestDist) { bestDist = d; snappedEnd = target; snapped = true; }
         }
         if (snapped) {
-            newOut = std::clamp(m_drag.startSourceInSec + (snappedEnd - startTrackPosSec),
-                                 m_drag.startSourceInSec + kMinClipLenSec, sourceLimit);
-            m_activeSnapSec = startTrackPosSec + (newOut - m_drag.startSourceInSec);
+            newOut = std::clamp(m_drag.startSourceInSec + (snappedEnd - startTrackPosSec) * rate,
+                                 m_drag.startSourceInSec + kMinClipLenSec * rate, sourceLimit);
+            m_activeSnapSec = startTrackPosSec + (newOut - m_drag.startSourceInSec) / rate;
         }
         primaryClip.sourceOutSec = newOut;
     }
@@ -1422,12 +1456,18 @@ void Timeline::mouseReleaseEvent(QMouseEvent* event) {
     // lane the pointer sweeps past on the way to the intended one.
     const bool changedLane = m_drag.mode == DragMode::MoveClip && m_drag.laneOffset != 0;
 
+    const bool wasEditing = m_drag.mode != DragMode::None;
+
     m_drag = DragState{};
     m_activeSnapSec = -1.0;
     updateCursorForPosition(event->pos()); // back to open-hand/arrow now the grab is over
     update();
 
     if (changedLane) emit clipsMovedBetweenTracks();
+    // Announced on RELEASE rather than per mouse-move: a single drag would
+    // otherwise fire this hundreds of times, and the answer it carries ("this
+    // project has unsaved changes") is the same every time.
+    if (wasEditing) emit projectModified();
 }
 
 void Timeline::leaveEvent(QEvent*) {
@@ -1593,6 +1633,7 @@ void Timeline::deleteClip(int trackIndex, int clipIndex) {
     updateGeometry(); // duration may have shrunk — let the scroll area know
     update();
     emit clipDeleted();
+    emit projectModified();
 }
 
 void Timeline::deleteSelectedClips() {
@@ -1658,12 +1699,93 @@ void Timeline::contextMenuEvent(QContextMenuEvent* event) {
         emit clipSelected(hit.trackIndex, hit.clipIndex);
     }
 
+    const Clip& clicked = m_project->tracks[hit.trackIndex].clips[hit.clipIndex];
+    const int selectionCount = m_selectedClipKeys.size();
+
     QMenu menu(this);
-    const QString label = m_selectedClipKeys.size() > 1
-        ? QString("Delete %1 Clips").arg(m_selectedClipKeys.size())
+
+    QMenu* speedMenu = menu.addMenu(selectionCount > 1
+        ? QString("Speed (%1 clips)").arg(selectionCount)
+        : QString("Speed"));
+
+    // Presets covering the range people actually reach for: slow motion below
+    // 1x, and the fast-forward multipliers above. 4x and 8x are the usual
+    // choices for compressing a long take without it reading as a timelapse.
+    const QVector<QPair<QString, double>> presets = {
+        {"0.25\u00d7  (slow motion)", 0.25}, {"0.5\u00d7", 0.5},
+        {"1\u00d7  (normal)", 1.0},
+        {"2\u00d7", 2.0}, {"4\u00d7", 4.0}, {"8\u00d7", 8.0},
+        {"16\u00d7  (timelapse)", 16.0},
+    };
+    for (const auto& preset : presets) {
+        QAction* action = speedMenu->addAction(preset.first);
+        action->setCheckable(true);
+        // Only ticked for a single selection: with a mixed group there's no one
+        // rate the tick could honestly represent.
+        action->setChecked(selectionCount == 1
+                           && std::fabs(clicked.speed - preset.second) < 1e-9);
+        connect(action, &QAction::triggered, this, [this, v = preset.second] {
+            applySpeedToSelection(v);
+        });
+    }
+    speedMenu->addSeparator();
+    const double clickedSpeed = clicked.speed; // copied: the menu outlives the reference
+    connect(speedMenu->addAction("Custom\u2026"), &QAction::triggered, this, [this, clickedSpeed] {
+        bool ok = false;
+        const double value = QInputDialog::getDouble(
+            this, "Clip Speed", "Playback rate  (1 = normal, 4 = four times faster):",
+            clickedSpeed, Clip::kMinSpeed, Clip::kMaxSpeed, 2, &ok);
+        if (ok) applySpeedToSelection(value);
+    });
+
+    menu.addSeparator();
+
+    // Split is MainWindow's to perform — it owns the follow-up work — so this
+    // asks rather than acts, using the same signal the toolbar button sends.
+    QAction* split = menu.addAction("Split at Playhead");
+    split->setEnabled(m_playheadSec > clicked.trackPosSec
+                   && m_playheadSec < clicked.trackPosSec + clicked.durationSec());
+    connect(split, &QAction::triggered, this, [this, hit] {
+        emit splitRequested(hit.trackIndex, hit.clipIndex, m_playheadSec);
+    });
+
+    const QString label = selectionCount > 1
+        ? QString("Delete %1 Clips").arg(selectionCount)
         : "Delete Clip";
     QAction* deleteAction = menu.addAction(label);
+
     if (menu.exec(event->globalPos()) == deleteAction) {
         deleteSelectedClips();
     }
 }
+
+void Timeline::applySpeedToSelection(double speed) {
+    if (!m_project) return;
+    const double rate = std::clamp(speed, Clip::kMinSpeed, Clip::kMaxSpeed);
+
+    bool changed = false;
+    for (qint64 key : m_selectedClipKeys) {
+        const int t = static_cast<int>(key >> 32);
+        const int c = static_cast<int>(key & 0xffffffffLL);
+        if (t < 0 || t >= m_project->tracks.size()) continue;
+        auto& clips = m_project->tracks[t].clips;
+        if (c < 0 || c >= clips.size()) continue;
+        if (std::fabs(clips[c].speed - rate) < 1e-9) continue;
+
+        // Only the speed changes. sourceIn/sourceOut stay put, so the clip still
+        // shows exactly the same footage; trackPosSec stays put, so the clip
+        // still starts where it was placed. What moves is the clip's END, and
+        // deliberately nothing downstream of it — there's no ripple anywhere
+        // else in this editor, and having speed alone shove the rest of the
+        // timeline around would be a surprise.
+        clips[c].speed = rate;
+        changed = true;
+    }
+    if (!changed) return;
+
+    updateGeometry(); // clip lengths changed, so the scrollable width did too
+    update();
+    emit clipSpeedChanged();
+    emit projectModified();
+}
+

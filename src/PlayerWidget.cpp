@@ -236,6 +236,16 @@ double PlayerWidget::durationSec() const {
     return dur;
 }
 
+void PlayerWidget::setSpeed(double speed) {
+    if (!m_mpv) return;
+    double rate = std::clamp(speed, Clip::kMinSpeed, Clip::kMaxSpeed);
+    // Setting this every sync tick would be wasteful and can make mpv stutter,
+    // so it only goes through when it actually changes.
+    if (std::fabs(rate - m_speed) < 1e-6) return;
+    m_speed = rate;
+    mpv_set_property(m_mpv, "speed", MPV_FORMAT_DOUBLE, &rate);
+}
+
 void PlayerWidget::setBlackout(bool on) {
     m_videoStack->setCurrentWidget(on ? static_cast<QWidget*>(m_blackOverlay)
                                        : static_cast<QWidget*>(m_videoSurface));

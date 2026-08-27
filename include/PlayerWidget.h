@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QWidget>
+#include "Project.h"
 #include <QHash>
 #include <QImage>
 #include <mpv/client.h>
@@ -52,6 +53,11 @@ public:
     // the class comment for why this swaps sibling widgets rather than
     // overlaying a child on the native video surface.
     void setBlackout(bool on);
+
+    // Playback rate, for clips with a speed other than 1.0. mpv resamples audio
+    // with pitch correction on by default, so a sped-up clip doesn't chipmunk
+    // in the preview the way a naive resample would.
+    void setSpeed(double speed);
 
     // Composites a still image on top of the decoded video via mpv's
     // native overlay-add command — this is NOT Qt-side drawing, it's mpv
@@ -151,6 +157,8 @@ private:
     // and for what gets reported via userToggledPlayback; only the button
     // click itself ever changes it.
     bool m_uiPlayingState = false;
+
+    double m_speed = 1.0; // last rate pushed to mpv; see setSpeed
 
     static constexpr double kSkipSeconds = 10.0;
 };

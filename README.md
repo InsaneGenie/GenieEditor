@@ -1,4 +1,4 @@
-# Video Editor — project skeleton
+# GenieEditor
 
 A lightweight NLE skeleton: multi-track timeline, libmpv preview playback,
 FFmpeg-based export pipeline, and a whisper.cpp transcription hook.
@@ -357,7 +357,7 @@ cd vcpkg
 .\bootstrap-vcpkg.bat
 .\vcpkg install qt6-base qt6-multimedia mpv ffmpeg --triplet x64-windows
 
-cd path\to\videoeditor
+cd path\to\GenieEditor
 mkdir build && cd build
 cmake .. -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>\scripts\buildsystems\vcpkg.cmake
 cmake --build . --config Debug

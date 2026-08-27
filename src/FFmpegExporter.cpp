@@ -98,6 +98,29 @@ GraphFileOption probeGraphFileOption(const QString& ffmpegPath) {
 // command, and the export must not depend on a decode succeeding at that
 // point. GIF is the only animated format routed to overlay tracks on import,
 // so the two agree by construction.
+// Audio rate change, pitch-preserved.
+//
+// atempo is CHAINED rather than used once because a single instance is only
+// well-conditioned over a limited range (historically 0.5–2.0, and quality
+// degrades toward the extremes even where a wider range is accepted). Halving
+// or doubling repeatedly until the remainder is inside that range gives the
+// same overall factor built from steps the filter handles cleanly — the
+// standard way to reach 4x or 8x without artefacts.
+//
+// Returns an empty string at 1x so the caller can skip the filter entirely.
+QString atempoChain(double speed) {
+    if (std::fabs(speed - 1.0) < 1e-6) return QString();
+
+    QStringList stages;
+    double remaining = speed;
+    while (remaining > 2.0) { stages << "atempo=2.0"; remaining /= 2.0; }
+    while (remaining < 0.5) { stages << "atempo=0.5"; remaining *= 2.0; }
+    if (std::fabs(remaining - 1.0) > 1e-6) {
+        stages << QString("atempo=%1").arg(QString::number(remaining, 'f', 6));
+    }
+    return stages.join(",");
+}
+
 bool isAnimatedOverlaySource(const QString& path) {
     return QFileInfo(path).suffix().compare("gif", Qt::CaseInsensitive) == 0;
 }
@@ -190,7 +213,18 @@ QString FFmpegExporter::buildFilterGraph(const Project& project, const Options& 
             // front of it, which also guarantees the overlay filter has frames
             // available from t=0 — without it, overlay stalls waiting for a
             // second input that doesn't begin until later.
-            chains << QString("[%1:v]trim=start=%2:end=%3,setpts=PTS-STARTPTS,"
+            // Speed is applied by dividing presentation timestamps: at 4x each
+            // frame is stamped a quarter as far apart, so the same source
+            // frames occupy a quarter of the time. It goes immediately after
+            // the STARTPTS reset and before fps, so the fps filter resamples
+            // the already-compressed stream to the output rate — the other
+            // order would resample first and then compress, leaving the output
+            // at four times the requested frame rate.
+            const QString speedFilter = std::fabs(clip.effectiveSpeed() - 1.0) < 1e-6
+                ? QString()
+                : QString("setpts=PTS/%1,").arg(num(clip.effectiveSpeed(), 6));
+
+            chains << QString("[%1:v]trim=start=%2:end=%3,setpts=PTS-STARTPTS,%9"
                               "scale=%4:%5:force_original_aspect_ratio=decrease,"
                               "pad=%4:%5:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=%6,"
                               "format=yuv420p,tpad=start_duration=%7[%8]")
@@ -199,7 +233,8 @@ QString FFmpegExporter::buildFilterGraph(const Project& project, const Options& 
                           .arg(options.width).arg(options.height)
                           .arg(num(options.fps, 3))
                           .arg(num(start, 3))
-                          .arg(src);
+                          .arg(src)
+                          .arg(speedFilter);
 
             chains << QString("[%1][%2]overlay=x=0:y=0:eof_action=pass:repeatlast=0:"
                               "enable='between(t,%3,%4)'[%5]")
@@ -359,13 +394,21 @@ QString FFmpegExporter::buildFilterGraph(const Project& project, const Options& 
             // Per-clip and per-track gain are both in dB and sum, matching the
             // model's documented mixing math. aresample keeps every branch at a
             // single rate so amix isn't handed mismatched inputs.
-            chains << QString("[%1:a]atrim=start=%2:end=%3,asetpts=PTS-STARTPTS,"
+            // atempo rather than asetpts, because this is the pitch-preserving
+            // one — asetpts would resample and chipmunk the audio, which is
+            // exactly the artefact that makes a sped-up section sound amateur.
+            // Placed before aresample so the rate conversion happens once, on
+            // the already-stretched stream.
+            const QString tempo = atempoChain(clip.effectiveSpeed());
+
+            chains << QString("[%1:a]atrim=start=%2:end=%3,asetpts=PTS-STARTPTS,%7"
                               "aresample=48000,volume=%4dB,adelay=%5:all=1[%6]")
                           .arg(inputIndex)
                           .arg(num(clip.sourceInSec, 3)).arg(num(clip.sourceOutSec, 3))
                           .arg(num(clip.gainDb + track.gainDb, 2))
                           .arg(delayMs)
-                          .arg(label);
+                          .arg(label)
+                          .arg(tempo.isEmpty() ? QString() : tempo + ",");
 
             audioLabels << label;
             ++inputIndex;

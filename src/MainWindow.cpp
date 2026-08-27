@@ -7,12 +7,14 @@
 #include "OverlayInspectorPanel.h"
 #include "OverlayStageWidget.h"
 #include "KlipyPanel.h"
+#include "SoundEffectsPanel.h"
 #include "Transcriber.h"
 #include "FFmpegExporter.h"
 #include "MediaProbe.h"
 #include "WaveformGenerator.h"
 #include "ThumbnailGenerator.h"
 #include "OverlayImageLoader.h"
+#include "ProjectSerializer.h"
 #include "Theme.h"
 
 #include <QVBoxLayout>
@@ -83,9 +85,24 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     buildMenus();
 
     resize(1280, 800);
-    setWindowTitle("Video Editor");
+    updateWindowTitle();
 
     restoreLayout();
+
+    // Reopen whatever was open last time. This is what makes closing the app
+    // and coming back feel like resuming rather than starting over — the panel
+    // layout was already restored above, and the project is the other half of
+    // "how I left it".
+    //
+    // Deferred to the event loop rather than run here: opening a project seeks
+    // the timeline and loads media into the players, and doing that before the
+    // window has been shown means laying out against widgets that have no size
+    // yet — zoom-to-fit in particular would compute against a zero-width
+    // viewport.
+    QTimer::singleShot(0, this, [this] {
+        const QString last = QSettings().value("lastProject").toString();
+        if (!last.isEmpty() && QFileInfo::exists(last)) openProjectFile(last);
+    });
 }
 
 void MainWindow::buildUi() {
@@ -142,6 +159,13 @@ void MainWindow::buildUi() {
     m_headerScrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     connect(m_timelineScrollArea->verticalScrollBar(), &QScrollBar::valueChanged,
             m_headerScrollArea->verticalScrollBar(), &QScrollBar::setValue);
+
+    // Timeline paints its ruler at this offset so it stays pinned to the top of
+    // the viewport instead of scrolling out of sight. It can't read the value
+    // itself — it's the scrolled child, and its own geometry says nothing about
+    // where the viewport currently sits.
+    connect(m_timelineScrollArea->verticalScrollBar(), &QScrollBar::valueChanged,
+            m_timeline, &Timeline::setVerticalScrollOffset);
 
     // --- Timeline tool strip ---------------------------------------------
     // Split lives here rather than in the window's main toolbar: it acts on the
@@ -428,6 +452,7 @@ void MainWindow::buildUi() {
     connect(m_overlayInspector, &OverlayInspectorPanel::seekRequested,
             this, &MainWindow::seekTimeline);
     connect(m_overlayInspector, &OverlayInspectorPanel::animationChanged, this, [this] {
+        markProjectDirty();
         syncOverlaysToTimeline(m_currentTimelineSec);
         if (m_overlayStage) m_overlayStage->refresh();
         m_timeline->update();
@@ -458,6 +483,28 @@ void MainWindow::buildUi() {
                            | QDockWidget::DockWidgetFloatable
                            | QDockWidget::DockWidgetClosable);
     tabifyDockWidget(m_mediaBrowserDock, m_klipyDock);
+
+    // --- Sound effects ---------------------------------------------------
+    m_soundEffectsPanel = new SoundEffectsPanel();
+    connect(m_soundEffectsPanel, &SoundEffectsPanel::soundReady, this, [this](const QString& path) {
+        // Onto an AUDIO track at the playhead, for the same reason a GIF lands
+        // as an overlay at the playhead: a sound effect punctuates the moment
+        // being watched, and appending it past the end of the footage would put
+        // it where there is nothing to punctuate.
+        importAudioOnlyFileAt(path, /*trackIndex=*/1, m_currentTimelineSec);
+    });
+
+    m_soundEffectsDock = new QDockWidget("Sounds", this);
+    m_soundEffectsDock->setObjectName("SoundEffectsDock");
+    m_soundEffectsDock->setWidget(m_soundEffectsPanel);
+    m_soundEffectsDock->setFeatures(QDockWidget::DockWidgetMovable
+                                  | QDockWidget::DockWidgetFloatable
+                                  | QDockWidget::DockWidgetClosable);
+    // Tabbed alongside the GIF panel: both are "browse a library, drop it on the
+    // timeline" tools competing for the same space, rather than things you need
+    // visible at once.
+    tabifyDockWidget(m_klipyDock, m_soundEffectsDock);
+
     m_mediaBrowserDock->raise();
 
     // Direct manipulation on the preview itself. Shares the inspector's notion of
@@ -467,6 +514,7 @@ void MainWindow::buildUi() {
     m_overlayStage = new OverlayStageWidget(this);
     m_overlayStage->attachTo(m_player->videoSurface());
     connect(m_overlayStage, &OverlayStageWidget::transformChanged, this, [this] {
+        markProjectDirty();
         syncOverlaysToTimeline(m_currentTimelineSec);
         m_overlayInspector->setPlayheadSec(m_currentTimelineSec); // pull the sliders along
 
@@ -506,6 +554,23 @@ void MainWindow::buildUi() {
     });
     connect(m_timeline, &Timeline::clipDeleted, this, &MainWindow::onClipDeleted);
     connect(m_timeline, &Timeline::clipsMovedBetweenTracks, this, &MainWindow::onClipsMovedBetweenTracks);
+    // The single place edits made INSIDE the timeline (drags, trims, splits,
+    // deletes, pins) become "unsaved changes". MainWindow's own mutations —
+    // importing, adding or removing tracks, overlay edits — mark themselves
+    // where they happen.
+    connect(m_timeline, &Timeline::projectModified, this, &MainWindow::markProjectDirty);
+    // Transcript timestamps are RULER positions, so moving, trimming or
+    // splitting a clip changes them even though the words themselves are
+    // untouched. Without this the panel keeps showing where the dialogue used
+    // to be, which is worse than showing nothing.
+    connect(m_timeline, &Timeline::projectModified, this,
+            &MainWindow::refreshTranscriptTimestamps);
+    // A rate change alters clip lengths and therefore the project duration, and
+    // the players are still running at the old rate until they're re-synced.
+    connect(m_timeline, &Timeline::clipSpeedChanged, this, [this] {
+        refreshTrackViews();
+        seekTimeline(m_currentTimelineSec);
+    });
     connect(m_trackHeaderPanel, &TrackHeaderPanel::muteToggled, this, [this](int) {
         m_timeline->update(); // repaint so the muted track's clips dim
     });
@@ -601,10 +666,18 @@ void MainWindow::applyDefaultLayout() {
 
 void MainWindow::buildMenus() {
     auto* fileMenu = menuBar()->addMenu("&File");
-    fileMenu->addAction("Import…", this, &MainWindow::onImportClicked);
-    fileMenu->addAction("Export…", this, &MainWindow::onExportClicked);
+    fileMenu->addAction("&New Project", QKeySequence::New, this, &MainWindow::onNewProject);
+    fileMenu->addAction("&Open Project…", QKeySequence::Open, this, &MainWindow::onOpenProject);
+    m_recentMenu = fileMenu->addMenu("Open &Recent");
+    rebuildRecentProjectsMenu();
     fileMenu->addSeparator();
-    fileMenu->addAction("Quit", this, &QWidget::close);
+    fileMenu->addAction("&Save Project", QKeySequence::Save, this, [this] { onSaveProject(); });
+    fileMenu->addAction("Save Project &As…", QKeySequence::SaveAs, this, [this] { onSaveProjectAs(); });
+    fileMenu->addSeparator();
+    fileMenu->addAction("&Import Media…", this, &MainWindow::onImportClicked);
+    fileMenu->addAction("&Export Video…", this, &MainWindow::onExportClicked);
+    fileMenu->addSeparator();
+    fileMenu->addAction("Quit", QKeySequence::Quit, this, &QWidget::close);
 
     // Standard "View" menu for toggling dock/toolbar visibility back on if
     // the user closes one — otherwise a closed dock has no way to reopen.
@@ -615,12 +688,13 @@ void MainWindow::buildMenus() {
     viewMenu->addAction(m_mediaBrowserDock->toggleViewAction());
     viewMenu->addAction(m_overlayDock->toggleViewAction());
     viewMenu->addAction(m_klipyDock->toggleViewAction());
+    viewMenu->addAction(m_soundEffectsDock->toggleViewAction());
     viewMenu->addSeparator();
     viewMenu->addAction("Reset panel layout", this, &MainWindow::resetLayout);
 }
 
 void MainWindow::restoreLayout() {
-    QSettings settings("VideoEditorProject", "VideoEditor");
+    QSettings settings;
     if (settings.contains("mainWindow/geometry")) {
         restoreGeometry(settings.value("mainWindow/geometry").toByteArray());
     }
@@ -644,13 +718,14 @@ void MainWindow::resetLayout() {
     // Docks can be dragged into arrangements that are hard to undo by hand —
     // and a closed dock with its View-menu entry also hidden is genuinely
     // unrecoverable. This is the way back.
-    for (QDockWidget* dock : {m_mediaBrowserDock, m_klipyDock, m_playerDock,
+    for (QDockWidget* dock : {m_mediaBrowserDock, m_klipyDock, m_soundEffectsDock, m_playerDock,
                               m_transcriptDock, m_overlayDock, m_timelineDock}) {
         if (dock) dock->setFloating(false);
         if (dock) dock->show();
     }
     addDockWidget(Qt::TopDockWidgetArea, m_mediaBrowserDock);
     tabifyDockWidget(m_mediaBrowserDock, m_klipyDock);
+    tabifyDockWidget(m_klipyDock, m_soundEffectsDock);
     m_mediaBrowserDock->raise();
     splitDockWidget(m_mediaBrowserDock, m_playerDock, Qt::Horizontal);
     splitDockWidget(m_playerDock, m_transcriptDock, Qt::Horizontal);
@@ -661,7 +736,19 @@ void MainWindow::resetLayout() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
-    QSettings settings("VideoEditorProject", "VideoEditor");
+    // Asked BEFORE anything is torn down, so Cancel really does put things back
+    // the way they were rather than leaving a half-closed window.
+    if (!confirmDiscardChanges()) {
+        event->ignore();
+        return;
+    }
+
+    QSettings settings;
+    // Which project to reopen next launch. Cleared when there isn't one, so
+    // quitting from an unsaved scratch project doesn't reopen something older
+    // and unrelated as though it were where you left off.
+    if (m_currentProjectPath.isEmpty()) settings.remove("lastProject");
+    else settings.setValue("lastProject", m_currentProjectPath);
     settings.setValue("mainWindow/geometry", saveGeometry());
     settings.setValue("mainWindow/state", saveState());
     settings.setValue("mainWindow/layoutVersion", kLayoutVersion);
@@ -677,6 +764,7 @@ void MainWindow::onImportClicked() {
 }
 
 void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, double trackPosSec) {
+    markProjectDirty();
     scheduleTranscriptionScan(); // a new source file may need transcribing
     // Fall back to the primary video track if the target isn't actually a
     // valid video track (e.g. called with a stale/out-of-range index).
@@ -752,7 +840,7 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
         if (videoClipIndex >= 0 && videoClipIndex < clips.size() && clips[videoClipIndex].sourcePath == path) {
             Clip& c = clips[videoClipIndex];
             c.thumbnails = strip.frames;
-            c.thumbnailSourceDurationSec = strip.durationSec > 0.0 ? strip.durationSec : c.durationSec();
+            c.thumbnailSourceDurationSec = strip.durationSec > 0.0 ? strip.durationSec : c.sourceDurationSec();
             m_timeline->update();
         }
     });
@@ -772,7 +860,7 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
                 Clip& c = clips[audioClipIndex];
                 c.waveformPeaks = waveform.peaks;
                 c.waveformRms = waveform.rms;
-                c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.durationSec();
+                c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.sourceDurationSec();
                 m_timeline->update();
             }
         });
@@ -781,6 +869,7 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
 }
 
 void MainWindow::importOverlayFileAt(const QString& path, int overlayTrackIndex, double trackPosSec) {
+    markProjectDirty();
     // Fall back to the first existing Overlay track, or create one if none
     // exists yet — avoids a dead-end where dropping an overlay image before
     // ever clicking "+ Overlay Track" would otherwise silently do nothing.
@@ -897,6 +986,10 @@ void MainWindow::onDeleteTrackRequested(int trackIndex) {
 }
 
 void MainWindow::refreshTrackViews() {
+    // Reached by every add/remove-track path, so it's the cheapest correct place
+    // to catch those. Loading calls it too, which is why adoptLoadedProject
+    // clears the flag AFTER refreshing rather than before.
+    markProjectDirty();
     updateProjectStats();
     scheduleTranscriptionScan(); // the track or clip set just changed
     m_timeline->setProject(&m_project);
@@ -932,6 +1025,7 @@ void MainWindow::setupAudioPlayerForTrack(int trackIndex) {
 }
 
 void MainWindow::importAudioOnlyFileAt(const QString& path, int trackIndex, double trackPosSec) {
+    markProjectDirty();
     scheduleTranscriptionScan(); // a new source file may need transcribing
     // Fall back to Audio 1 if the drop landed somewhere that isn't actually
     // an audio track (e.g. dropped onto the video lane, or the ruler).
@@ -969,7 +1063,7 @@ void MainWindow::importAudioOnlyFileAt(const QString& path, int trackIndex, doub
             Clip& c = clips[clipIndex];
             c.waveformPeaks = waveform.peaks;
             c.waveformRms = waveform.rms;
-            c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.durationSec();
+            c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.sourceDurationSec();
             m_timeline->update();
         }
     });
@@ -1038,7 +1132,7 @@ void MainWindow::onThumbnailDetailNeeded(int trackIndex, int clipIndex, int desi
         // case the result may no longer actually be an improvement).
         if (c.sourcePath == path && strip.frames.size() > c.thumbnails.size()) {
             c.thumbnails = strip.frames;
-            c.thumbnailSourceDurationSec = strip.durationSec > 0.0 ? strip.durationSec : c.durationSec();
+            c.thumbnailSourceDurationSec = strip.durationSec > 0.0 ? strip.durationSec : c.sourceDurationSec();
             m_timeline->update();
         }
     });
@@ -1573,7 +1667,14 @@ void MainWindow::syncVideoToTimeline(double timelineSeconds) {
 
     m_player->setBlackout(false);
     const Clip& clip = m_project.tracks[winningTrackIndex].clips[winningClipIndex];
-    const double expectedSourceSec = clip.sourceInSec + (timelineSeconds - clip.trackPosSec);
+    // Through the clip, not by subtraction: on a sped-up clip one timeline
+    // second is several source seconds.
+    const double expectedSourceSec = clip.sourceTimeAt(timelineSeconds);
+    // The master clock advances timeline time at 1x, so the DECODER has to run
+    // at the clip's rate for source position and timeline position to stay in
+    // agreement. Without this the drift correction below would fight playback
+    // forever, re-seeking every tick as the two bases pulled apart.
+    m_player->setSpeed(clip.effectiveSpeed());
     // Only reload when the FILE actually differs — cutting a clip creates
     // two clips sharing the same sourcePath, so clipIdx changes at every
     // cut even though there's nothing new to open. Reloading on index
@@ -1609,8 +1710,13 @@ void MainWindow::syncVideoToTimeline(double timelineSeconds) {
         // large jumps well above this threshold); mpv naturally stays in
         // sync during uninterrupted continuous playback, so there's no
         // benefit to correcting sub-second drift, only cost.
+        // Drift is measured in SOURCE seconds, which elapse faster than timeline
+        // seconds on a sped-up clip. Scaling the threshold keeps "0.75s of
+        // timeline" as the tolerance at every rate — a fixed source-second
+        // threshold would be four times stricter on a 4x clip and trigger
+        // constant corrective seeks.
         const double drift = std::fabs(m_player->positionSec() - expectedSourceSec);
-        if (drift > 0.75) {
+        if (drift > 0.75 * clip.effectiveSpeed()) {
             m_player->seek(expectedSourceSec, /*exact=*/false);
         }
     }
@@ -1626,7 +1732,12 @@ QImage MainWindow::renderOverlayBitmap(int trackIndex, int clipIndex, const Clip
     // indexAt loops, so stretching the clip past the source's own length keeps
     // it playing instead of freezing — matching what the export does.
     const OverlayFrames animation = OverlayImageLoader::loadFrames(clip.sourcePath);
-    const int frameIndex = animation.indexAt(localSec);
+    // Animation frames are picked in SOURCE time, so a sped-up overlay plays
+    // its GIF faster. The keyframed transforms below stay in clip-local
+    // TIMELINE time — those are authored against the clip as it sits on the
+    // timeline, and rescaling them would move a keyframe away from the frame it
+    // was placed on.
+    const int frameIndex = animation.indexAt(localSec * clip.effectiveSpeed());
     if (frameIndex < 0) return QImage();
     const QImage& source = animation.frames[frameIndex];
     if (source.isNull() || source.width() <= 0) return QImage();
@@ -1781,7 +1892,8 @@ void MainWindow::syncAudioTracksToTimeline(double timelineSeconds) {
         }
 
         const Clip& clip = track.clips[clipIdx];
-        const double expectedSourceSec = clip.sourceInSec + (timelineSeconds - clip.trackPosSec);
+        const double expectedSourceSec = clip.sourceTimeAt(timelineSeconds);
+        audio.player->setSpeed(clip.effectiveSpeed()); // see syncVideoToTimeline
         // Same fix as syncVideoToTimeline: only reload on an actual file
         // change, not merely a different clip index (which changes at
         // every cut even within one continuous source file).
@@ -1794,9 +1906,10 @@ void MainWindow::syncAudioTracksToTimeline(double timelineSeconds) {
             audio.awaitingSeekAfterLoad = true;
             audio.player->loadFile(clip.sourcePath);
         } else {
-            // Same reasoning as syncVideoToTimeline — raised to 0.75s.
+            // Same reasoning as syncVideoToTimeline, threshold scaled by rate
+            // for the same reason.
             const double drift = std::fabs(audio.player->positionSec() - expectedSourceSec);
-            if (drift > 0.75) {
+            if (drift > 0.75 * clip.effectiveSpeed()) {
                 audio.player->seek(expectedSourceSec, /*exact=*/false);
             }
         }
@@ -1862,7 +1975,10 @@ double MainWindow::mapSourceTimeToTimelineSec(int trackIndex, const QString& sou
     for (const Clip& clip : track.clips) {
         if (clip.sourcePath != sourcePath) continue;
         if (sourceTimeSec >= clip.sourceInSec && sourceTimeSec <= clip.sourceOutSec) {
-            return clip.trackPosSec + (sourceTimeSec - clip.sourceInSec);
+            // Through the clip rather than by addition: a word four source
+            // seconds into a 4x clip lands one timeline second in, and clicking
+            // the transcript has to seek to where it actually plays.
+            return clip.timelineTimeAt(sourceTimeSec);
         }
     }
     return -1.0; // no current clip covers this moment
@@ -1879,8 +1995,44 @@ QString MainWindow::formatTranscriptTimestamp(double seconds) const {
         .arg(secs, 2, 10, QChar('0'));
 }
 
-void MainWindow::populateTranscriptList(QListWidget* list, const QVector<TranscriptSegment>& segments) {
+void MainWindow::refreshTranscriptTimestamps() {
+    // Repopulates in place WITHOUT switching tabs or touching which track is
+    // shown — this runs after every edit, and yanking the visible tab around
+    // each time a clip is nudged would make the panel unusable.
+    for (auto it = m_transcriptListByTrack.constBegin();
+         it != m_transcriptListByTrack.constEnd(); ++it) {
+        if (!it.value()) continue;
+        const int scroll = it.value()->verticalScrollBar()->value();
+        populateTranscriptList(it.value(), it.key());
+        it.value()->verticalScrollBar()->setValue(scroll); // keep the reader's place
+    }
+
+    // Re-highlight, since repopulating cleared the previous match markers.
+    if (m_transcriptSearchBox && !m_transcriptSearchBox->text().isEmpty()) {
+        onTranscriptSearchTextChanged(m_transcriptSearchBox->text());
+    }
+}
+
+void MainWindow::seekToTranscriptRow(QListWidget* list, int row) {
+    if (!list || row < 0 || row >= list->count()) return;
+    QListWidgetItem* item = list->item(row);
+    if (!item) return;
+
+    const QVariant stored = item->data(Qt::UserRole + 1);
+    if (!stored.isValid()) return; // the placeholder row, which isn't a segment
+
+    // The position was resolved when the row was built, against the specific
+    // clip that plays it. Re-deriving it here from the segment would reopen the
+    // same ambiguity the rows exist to settle.
+    seekTimeline(std::max(0.0, stored.toDouble()));
+}
+
+void MainWindow::populateTranscriptList(QListWidget* list, int trackIndex) {
     list->clear();
+    const QVector<TranscriptSegment>& segments =
+        (trackIndex >= 0 && trackIndex < m_project.tracks.size())
+            ? m_project.tracks[trackIndex].transcript
+            : QVector<TranscriptSegment>();
 
     // An empty transcript panel used to be a blank white-on-dark void with no
     // indication of what it was for or how to fill it. An empty state should be
@@ -1894,10 +2046,32 @@ void MainWindow::populateTranscriptList(QListWidget* list, const QVector<Transcr
         return;
     }
 
-    for (int i = 0; i < segments.size(); ++i) {
-        const QString timestamp = formatTranscriptTimestamp(segments[i].startSec);
-        auto* item = new QListWidgetItem(QString("%1   %2").arg(timestamp, segments[i].text), list);
-        item->setData(Qt::UserRole, i); // segment index within THIS track's transcript
+    const QVector<TranscriptRow> rows =
+        (trackIndex >= 0 && trackIndex < m_project.tracks.size())
+            ? ::buildTranscriptRows(m_project.tracks[trackIndex])
+            : QVector<TranscriptRow>();
+
+    // Every segment was trimmed out of the edit. Saying so beats an empty panel
+    // that looks identical to one that was never transcribed.
+    if (rows.isEmpty()) {
+        auto* placeholder = new QListWidgetItem(
+            "None of this track's transcript falls inside the current clips.\n\n"
+            "Extend a trim and the lines will reappear \u2014 nothing was deleted.", list);
+        placeholder->setFlags(Qt::NoItemFlags);
+        placeholder->setForeground(QBrush(Theme::textFaint()));
+        return;
+    }
+
+    for (const TranscriptRow& row : rows) {
+        // The timestamp is the position on the RULER, which is what it's used
+        // for. Showing the offset within the source file made it wrong for
+        // every clip that doesn't start at 0:00 — and misleadingly right for
+        // the one that does, which is why a single-clip track looked fine.
+        const QString timestamp = formatTranscriptTimestamp(row.timelineSec);
+        const QString text = segments[row.segmentIndex].text;
+        auto* item = new QListWidgetItem(QString("%1   %2").arg(timestamp, text), list);
+        item->setData(Qt::UserRole, row.segmentIndex);
+        item->setData(Qt::UserRole + 1, row.timelineSec);
         item->setToolTip("Double-click to jump the playhead here");
     }
 }
@@ -1922,14 +2096,12 @@ void MainWindow::rebuildTranscriptTabs() {
         list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         list->setSpacing(1);
         list->setFont(Theme::monoFont(-1));
-        connect(list, &QListWidget::itemDoubleClicked, this, [this, i](QListWidgetItem* item) {
-            // Seeks to the segment's FIRST word — a simple but functional
-            // click-to-seek; onTranscriptWordClicked already supports true
-            // per-word granularity for a future custom item delegate that
-            // renders individual clickable words within a segment.
-            onTranscriptWordClicked(i, item->data(Qt::UserRole).toInt(), 0);
+        connect(list, &QListWidget::itemDoubleClicked, this, [this, list](QListWidgetItem* item) {
+            // Seeks to the position stored on the row, which was resolved
+            // against the clip that actually plays it.
+            seekToTranscriptRow(list, list->row(item));
         });
-        populateTranscriptList(list, m_project.tracks[i].transcript);
+        populateTranscriptList(list, i);
         m_transcriptListByTrack[i] = list;
 
         const int tabIndex = m_transcriptTabs->addTab(list, m_project.tracks[i].name);
@@ -1947,7 +2119,7 @@ void MainWindow::refreshTranscriptTab(int trackIndex) {
         return;
     }
 
-    populateTranscriptList(m_transcriptListByTrack[trackIndex], m_project.tracks[trackIndex].transcript);
+    populateTranscriptList(m_transcriptListByTrack[trackIndex], trackIndex);
 
     for (int i = 0; i < m_transcriptTabs->count(); ++i) {
         if (m_transcriptTabs->tabBar()->tabData(i).toInt() == trackIndex) {
@@ -2005,7 +2177,7 @@ void MainWindow::onTranscriptSearchNext() {
     list->scrollToItem(list->item(row));
     list->setCurrentRow(row);
     // also jump the playhead there
-    onTranscriptWordClicked(currentTranscriptTrackIndex(), list->item(row)->data(Qt::UserRole).toInt(), 0);
+    seekToTranscriptRow(list, row);
 }
 
 void MainWindow::onTranscriptSearchPrev() {
@@ -2016,6 +2188,300 @@ void MainWindow::onTranscriptSearchPrev() {
     const int row = m_transcriptSearchMatches[m_transcriptSearchCurrentMatch];
     list->scrollToItem(list->item(row));
     list->setCurrentRow(row);
-    onTranscriptWordClicked(currentTranscriptTrackIndex(), list->item(row)->data(Qt::UserRole).toInt(), 0);
+    seekToTranscriptRow(list, row);
 }
 
+
+// ---------------------------------------------------------------------------
+// Project files
+// ---------------------------------------------------------------------------
+
+void MainWindow::markProjectDirty() {
+    if (m_projectDirty) return; // title already says so; nothing to redo
+    m_projectDirty = true;
+    updateWindowTitle();
+}
+
+void MainWindow::updateWindowTitle() {
+    const QString name = m_currentProjectPath.isEmpty()
+        ? QStringLiteral("Untitled project")
+        : QFileInfo(m_currentProjectPath).completeBaseName();
+    // The leading asterisk is the platform convention for unsaved changes, and
+    // it's the only always-visible signal that closing now would lose work.
+    setWindowTitle(QString("%1%2 \u2014 GenieEditor").arg(m_projectDirty ? "*" : "", name));
+}
+
+void MainWindow::setCurrentProjectPath(const QString& path) {
+    m_currentProjectPath = path;
+    updateWindowTitle();
+}
+
+void MainWindow::rememberRecentProject(const QString& path) {
+    QSettings settings;
+    QStringList recent = settings.value("recentProjects").toStringList();
+    recent.removeAll(path);
+    recent.prepend(path);
+    while (recent.size() > 8) recent.removeLast();
+    settings.setValue("recentProjects", recent);
+    settings.setValue("lastProject", path);
+    rebuildRecentProjectsMenu();
+}
+
+void MainWindow::rebuildRecentProjectsMenu() {
+    if (!m_recentMenu) return;
+    m_recentMenu->clear();
+
+    QSettings settings;
+    QStringList recent = settings.value("recentProjects").toStringList();
+    // Entries that have since been deleted or moved are dropped rather than
+    // offered — a menu item that can only produce an error isn't a shortcut.
+    recent.erase(std::remove_if(recent.begin(), recent.end(),
+                                [](const QString& p) { return !QFileInfo::exists(p); }),
+                 recent.end());
+    settings.setValue("recentProjects", recent);
+
+    if (recent.isEmpty()) {
+        m_recentMenu->addAction("No recent projects")->setEnabled(false);
+        return;
+    }
+    for (const QString& path : recent) {
+        m_recentMenu->addAction(QFileInfo(path).completeBaseName(), this,
+                                [this, path] { 
+            if (!confirmDiscardChanges()) return;
+            openProjectFile(path);
+        })->setToolTip(QDir::toNativeSeparators(path));
+    }
+}
+
+bool MainWindow::confirmDiscardChanges() {
+    if (!m_projectDirty) return true;
+
+    const QMessageBox::StandardButton answer = QMessageBox::warning(
+        this, "Unsaved changes",
+        QString("\"%1\" has changes that haven't been saved.")
+            .arg(m_currentProjectPath.isEmpty()
+                     ? QStringLiteral("Untitled project")
+                     : QFileInfo(m_currentProjectPath).completeBaseName()),
+        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
+        QMessageBox::Save);
+
+    if (answer == QMessageBox::Cancel) return false;
+    if (answer == QMessageBox::Save) return onSaveProject(); // a cancelled Save As also cancels this
+    return true; // Discard
+}
+
+bool MainWindow::onSaveProject() {
+    if (m_currentProjectPath.isEmpty()) return onSaveProjectAs();
+
+    QString error;
+    if (!ProjectSerializer::save(m_project, m_currentProjectPath,
+                                 m_currentTimelineSec, m_timeline->pixelsPerSecond(), &error)) {
+        QMessageBox::critical(this, "Couldn't save", error);
+        return false;
+    }
+
+    m_projectDirty = false;
+    updateWindowTitle();
+    rememberRecentProject(m_currentProjectPath);
+    statusBar()->showMessage(QString("Saved %1")
+        .arg(QFileInfo(m_currentProjectPath).fileName()), 4000);
+    return true;
+}
+
+bool MainWindow::onSaveProjectAs() {
+    QString suggested = m_currentProjectPath;
+    if (suggested.isEmpty()) {
+        const QString dir = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+        suggested = QDir(dir.isEmpty() ? QDir::homePath() : dir)
+                        .absoluteFilePath("Untitled." + ProjectSerializer::fileExtension());
+    }
+
+    const QString path = QFileDialog::getSaveFileName(
+        this, "Save Project", suggested, ProjectSerializer::saveFilter());
+    if (path.isEmpty()) return false; // cancelled
+
+    // Qt only appends the extension on some platforms, and a project saved
+    // without one won't come back through the Open filter. Either of the app's
+    // own extensions counts as already-suffixed, so re-saving an older
+    // "edit.veproj" doesn't produce "edit.veproj.genie".
+    QString finalPath = path;
+    if (!ProjectSerializer::hasProjectExtension(finalPath)) {
+        finalPath += "." + ProjectSerializer::fileExtension();
+    }
+
+    setCurrentProjectPath(finalPath);
+    return onSaveProject();
+}
+
+void MainWindow::onOpenProject() {
+    if (!confirmDiscardChanges()) return;
+
+    const QString startDir = m_currentProjectPath.isEmpty()
+        ? QStandardPaths::writableLocation(QStandardPaths::MoviesLocation)
+        : QFileInfo(m_currentProjectPath).absolutePath();
+
+    const QString path = QFileDialog::getOpenFileName(
+        this, "Open Project", startDir, ProjectSerializer::openFilter());
+    if (path.isEmpty()) return;
+
+    openProjectFile(path);
+}
+
+void MainWindow::openProjectFile(const QString& path) {
+    Project loaded;
+    const ProjectSerializer::LoadResult result = ProjectSerializer::load(loaded, path);
+    if (!result.ok) {
+        QMessageBox::critical(this, "Couldn't open project", result.error);
+        return;
+    }
+
+    // Stop everything BEFORE the project is swapped out. The audio players and
+    // the master clock both index into m_project by track, and letting a tick
+    // land midway through the replacement would read tracks that no longer
+    // exist.
+    m_isPlayingIntent = false;
+    m_masterClockTimer->stop();
+    for (auto& audio : m_audioTracks) {
+        if (audio.player) audio.player->pause();
+    }
+
+    m_project = loaded;
+    setCurrentProjectPath(path);
+    m_projectDirty = false;
+
+    adoptLoadedProject(result.playheadSec, result.pixelsPerSecond);
+    rememberRecentProject(path);
+
+    if (!result.missingMedia.isEmpty()) {
+        // Named individually rather than counted: knowing WHICH file moved is
+        // the whole difference between fixing it and hunting for it. The clips
+        // are still on the timeline, so putting the files back is the only
+        // repair needed.
+        QStringList shown = result.missingMedia;
+        const int extra = std::max<int>(0, static_cast<int>(shown.size()) - 8);
+        while (shown.size() > 8) shown.removeLast();
+
+        QMessageBox::warning(this, "Some media couldn't be found",
+            QString("These files are referenced by the project but aren't where it "
+                    "expects them:\n\n%1%2\n\nThe clips are still on the timeline — "
+                    "put the files back and reopen the project to relink them.")
+                .arg(shown.join("\n"),
+                     extra > 0 ? QString("\n…and %1 more").arg(extra) : QString()));
+    }
+
+    statusBar()->showMessage(QString("Opened %1").arg(QFileInfo(path).fileName()), 4000);
+}
+
+void MainWindow::onNewProject() {
+    if (!confirmDiscardChanges()) return;
+
+    m_isPlayingIntent = false;
+    m_masterClockTimer->stop();
+    for (auto& audio : m_audioTracks) {
+        if (audio.player) audio.player->pause();
+    }
+
+    Project fresh;
+    fresh.addTrack(TrackType::Video, "Video 1");
+    fresh.addTrack(TrackType::Audio, "Audio 1");
+    fresh.addTrack(TrackType::Audio, "Audio 2");
+    fresh.tracks[0].pairedAudioTrackIndex = 1;
+
+    m_project = fresh;
+    setCurrentProjectPath(QString());
+    m_projectDirty = false;
+    adoptLoadedProject(0.0, 0.0);
+}
+
+void MainWindow::adoptLoadedProject(double playheadSec, double pixelsPerSecond) {
+    // Every AudioPlayer is torn down and rebuilt rather than reused. They're
+    // bound to a track INDEX, and the new project's track list has no
+    // relationship to the old one's — a reused player would drive the wrong
+    // track, or a track that no longer exists.
+    for (auto& audio : m_audioTracks) {
+        if (audio.player) {
+            audio.player->pause();
+            audio.player->deleteLater();
+        }
+    }
+    m_audioTracks.clear();
+    for (int i = 0; i < m_project.tracks.size(); ++i) {
+        if (m_project.tracks[i].type == TrackType::Audio) setupAudioPlayerForTrack(i);
+    }
+
+    // Overlay state keys off track/clip indices too, and every one of those is
+    // now stale.
+    m_activeOverlayClipByTrack.clear();
+    m_overlayCacheByTrack.clear();
+    m_pendingThumbnailUpgrades.clear();
+    for (int t = 0; t < m_project.tracks.size(); ++t) m_player->clearOverlay(t + 1);
+    setOverlaySelection(-1, -1);
+
+    m_timeline->clearSelection();
+    m_currentLoadedPath.clear(); // force a reload rather than trusting what is on screen
+
+    refreshTrackViews();
+
+    if (pixelsPerSecond > 0.0) m_timeline->setPixelsPerSecond(pixelsPerSecond);
+    else m_timeline->zoomToFit(m_timelineScrollArea->viewport()->width());
+
+    regenerateAllClipVisuals();
+
+    seekTimeline(std::max(0.0, playheadSec));
+    updateProjectStats();
+
+    // Last, deliberately: refreshTrackViews and the import helpers above all
+    // mark the project dirty, and a project that was just opened has by
+    // definition no unsaved changes yet.
+    m_projectDirty = false;
+    updateWindowTitle();
+}
+
+void MainWindow::regenerateAllClipVisuals() {
+    for (int t = 0; t < m_project.tracks.size(); ++t) {
+        const Track& track = m_project.tracks[t];
+        // Overlay clips have neither a waveform nor a filmstrip — the overlay
+        // compositor reads their source directly.
+        if (track.type == TrackType::Overlay) continue;
+
+        for (int c = 0; c < track.clips.size(); ++c) {
+            const QString path = track.clips[c].sourcePath;
+            if (path.isEmpty() || !QFileInfo::exists(path)) continue; // relinking is the fix, not a decode error
+
+            if (track.type == TrackType::Video) {
+                auto* watcher = new QFutureWatcher<ThumbnailStrip>(this);
+                connect(watcher, &QFutureWatcher<ThumbnailStrip>::finished, this,
+                        [this, watcher, path, t, c] {
+                    const ThumbnailStrip strip = watcher->result();
+                    watcher->deleteLater();
+                    // Re-checked because the project can be closed, or clips
+                    // deleted, while this is still decoding in the background.
+                    if (t >= m_project.tracks.size()) return;
+                    auto& clips = m_project.tracks[t].clips;
+                    if (c >= clips.size() || clips[c].sourcePath != path) return;
+                    clips[c].thumbnails = strip.frames;
+                    clips[c].thumbnailSourceDurationSec =
+                        strip.durationSec > 0.0 ? strip.durationSec : clips[c].sourceDurationSec();
+                    m_timeline->update();
+                });
+                watcher->setFuture(QtConcurrent::run(&ThumbnailGenerator::generate, path, 12, 120, 68));
+            } else {
+                auto* watcher = new QFutureWatcher<WaveformData>(this);
+                connect(watcher, &QFutureWatcher<WaveformData>::finished, this,
+                        [this, watcher, path, t, c] {
+                    const WaveformData waveform = watcher->result();
+                    watcher->deleteLater();
+                    if (t >= m_project.tracks.size()) return;
+                    auto& clips = m_project.tracks[t].clips;
+                    if (c >= clips.size() || clips[c].sourcePath != path) return;
+                    clips[c].waveformPeaks = waveform.peaks;
+                    clips[c].waveformRms = waveform.rms;
+                    clips[c].waveformSourceDurationSec =
+                        waveform.durationSec > 0.0 ? waveform.durationSec : clips[c].sourceDurationSec();
+                    m_timeline->update();
+                });
+                watcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 0));
+            }
+        }
+    }
+}

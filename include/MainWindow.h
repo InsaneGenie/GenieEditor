@@ -63,6 +63,13 @@ private slots:
     void onThumbnailDetailNeeded(int trackIndex, int clipIndex, int desiredFullFileFrameCount);
     void onTimelineZoomAnchorChanged(double anchorSec, int oldPixelX);
     void onClipDeleted();
+
+    // --- Project files ------------------------------------------------------
+    void onNewProject();
+    void onOpenProject();
+    bool onSaveProject();      // false if the user cancelled the Save As it may need
+    bool onSaveProjectAs();
+    void openProjectFile(const QString& path);
     // A move gesture ended with clips in a different track than they started
     // in — see Timeline::clipsMovedBetweenTracks.
     void onClipsMovedBetweenTracks();
@@ -100,7 +107,9 @@ private:
 
     // Bumped whenever the default dock arrangement changes in a way existing
     // users should actually receive — see restoreLayout().
-    static constexpr int kLayoutVersion = 5;
+    // Bumped so an existing install picks up the new Sounds dock: a restored
+    // older layout describes an arrangement that has no place for it.
+    static constexpr int kLayoutVersion = 6;
 
     // Refreshes the status-bar summary after anything that changes the track
     // list or clip set.
@@ -180,6 +189,31 @@ private:
     // The companion audio clip is skipped when the source has no audio stream
     // (a GIF, a silent export) — MediaProbe::hasAudioStream decides, so the
     // test is what the file contains rather than what it's named.
+    // --- Project file plumbing ---------------------------------------------
+    // Rebuilds every piece of per-track machinery MainWindow owns to match
+    // whatever is now in m_project — audio players, header panel, transcript
+    // tabs, overlay bookkeeping. Loading replaces the project wholesale, so
+    // none of that state can be assumed to still line up.
+    void adoptLoadedProject(double playheadSec, double pixelsPerSecond);
+
+    // Kicks off waveform and thumbnail generation for every clip. These are
+    // deliberately not stored in the project file (see ProjectSerializer), so a
+    // freshly opened project has clips with no visuals until this fills them in.
+    void regenerateAllClipVisuals();
+
+    // Marks the project as having unsaved changes and refreshes the title bar.
+    // Cheap and idempotent, so it's safe to call from anything that mutates.
+    void markProjectDirty();
+    void updateWindowTitle();
+
+    // Offers to save when something is about to discard unsaved work.
+    // Returns false only if the user chose Cancel, meaning: don't proceed.
+    bool confirmDiscardChanges();
+
+    void setCurrentProjectPath(const QString& path);
+    void rememberRecentProject(const QString& path);
+    void rebuildRecentProjectsMenu();
+
     void importVideoFileAt(const QString& path, int videoTrackIndex, double trackPosSec);
     void importAudioOnlyFileAt(const QString& path, int trackIndex, double trackPosSec);
     // Places a still image as an Overlay-track clip. There's no
@@ -236,7 +270,15 @@ private:
 
     // Fills a transcript list widget with a track's segments (shared by
     // rebuildTranscriptTabs and refreshTranscriptTab).
-    void populateTranscriptList(QListWidget* list, const QVector<TranscriptSegment>& segments);
+    void populateTranscriptList(QListWidget* list, int trackIndex);
+
+    // Rebuilds every transcript tab's rows in place. Needed after any edit that
+    // moves audio on the timeline, since the displayed times are ruler
+    // positions rather than offsets within the source file.
+    void refreshTranscriptTimestamps();
+
+    // Seeks to the timeline position stored on a transcript row.
+    void seekToTranscriptRow(QListWidget* list, int row);
 
     // Which audio track's tab is currently active, or -1 if there are no
     // tabs at all — used by the search functions, which operate on
@@ -270,6 +312,13 @@ private:
     void refreshTrackViews();
 
     Project m_project;
+
+    // Where this project lives on disk, empty for one that has never been
+    // saved. Drives the title bar, and decides whether Save can write straight
+    // out or has to ask for a location first.
+    QString m_currentProjectPath;
+    bool m_projectDirty = false;
+    class QMenu* m_recentMenu = nullptr;
     PlayerWidget* m_player = nullptr;
     Timeline* m_timeline = nullptr;
     TrackHeaderPanel* m_trackHeaderPanel = nullptr;
@@ -314,6 +363,8 @@ private:
     QDockWidget* m_mediaBrowserDock = nullptr;
     QDockWidget* m_overlayDock = nullptr;
     QDockWidget* m_klipyDock = nullptr;
+    class SoundEffectsPanel* m_soundEffectsPanel = nullptr;
+    QDockWidget* m_soundEffectsDock = nullptr;
 
     // Note: selection itself is owned entirely by Timeline (supports
     // multi-select) — MainWindow queries m_timeline->selectedClips() on

@@ -1,4 +1,7 @@
 #include "AudioPlayer.h"
+#include "Project.h"
+#include <algorithm>
+#include <cmath>
 
 #include <QByteArray>
 #include <vector>
@@ -75,6 +78,14 @@ bool AudioPlayer::isPaused() const {
 void AudioPlayer::setMuted(bool muted) {
     const int flag = muted ? 1 : 0;
     mpv_set_property(m_mpv, "mute", MPV_FORMAT_FLAG, const_cast<int*>(&flag));
+}
+
+void AudioPlayer::setSpeed(double speed) {
+    if (!m_mpv) return;
+    double rate = std::clamp(speed, Clip::kMinSpeed, Clip::kMaxSpeed);
+    if (std::fabs(rate - m_speed) < 1e-6) return; // only on actual change
+    m_speed = rate;
+    mpv_set_property(m_mpv, "speed", MPV_FORMAT_DOUBLE, &rate);
 }
 
 void AudioPlayer::setVolume(int percent) {
