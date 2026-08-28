@@ -1277,33 +1277,66 @@ void MainWindow::onExportClicked() {
         break;
     }
 
-    QProgressDialog progress("Rendering…", "Cancel", 0, 100, this);
+    QProgressDialog progress("Rendering\u2026", "Cancel", 0, 100, this);
     progress.setWindowTitle("Export");
+    // The label is now several lines, and QProgressDialog sizes itself to the
+    // text it was constructed with -- without a minimum it grows and shrinks as
+    // the numbers change width, which reads as flickering.
+    progress.setMinimumWidth(360);
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(0);
     progress.setAutoClose(false);
     progress.setAutoReset(false);
     progress.setValue(0);
 
-    QElapsedTimer elapsed;
-    elapsed.start();
+    QElapsedTimer exportElapsed;
+    exportElapsed.start();
 
     FFmpegExporter exporter;
-    const bool ok = exporter.exportProject(m_project, options, [&](double fraction) {
-        progress.setValue(static_cast<int>(fraction * 100));
+    const bool ok = exporter.exportProject(m_project, options,
+                                           [&](const FFmpegExporter::Progress& p) {
+        progress.setValue(static_cast<int>(p.fraction * 100));
 
-        // A time remaining estimate, once there's enough of a sample for it not
-        // to be nonsense. A render is long enough that "43% done" alone doesn't
-        // answer the question people are actually asking.
-        if (fraction > 0.03) {
-            const double totalMs = elapsed.elapsed() / fraction;
-            const int remainingSec = static_cast<int>((totalMs - elapsed.elapsed()) / 1000.0);
-            progress.setLabelText(QString("Rendering…  %1%   ·   about %2 remaining")
-                .arg(static_cast<int>(fraction * 100))
-                .arg(remainingSec >= 60
-                        ? QString("%1 min").arg((remainingSec + 30) / 60)
-                        : QString("%1 sec").arg(std::max(1, remainingSec))));
-        }
+        // Formatters kept local: these shapes are only meaningful here, and a
+        // render's numbers span a wide enough range that fixed units read badly
+        // at one end or the other.
+        auto duration = [](double sec) {
+            if (sec < 0.0) return QString("--");
+            const int total = static_cast<int>(sec + 0.5);
+            if (total >= 3600) return QString("%1h %2m").arg(total / 3600).arg((total % 3600) / 60);
+            if (total >= 60)   return QString("%1m %2s").arg(total / 60).arg(total % 60);
+            return QString("%1s").arg(total);
+        };
+        auto size = [](qint64 bytes) {
+            if (bytes <= 0) return QString("--");
+            if (bytes >= 1024LL * 1024 * 1024)
+                return QString("%1 GB").arg(bytes / (1024.0 * 1024 * 1024), 0, 'f', 2);
+            return QString("%1 MB").arg(bytes / (1024.0 * 1024), 0, 'f', 1);
+        };
+
+        // Speed is the number that actually tells you whether a settings change
+        // helped: 2x means two seconds of video rendered per second of waiting,
+        // and it is comparable between runs in a way that "43%" is not.
+        const QString speedText = p.speed > 0.01
+            ? QString("%1x realtime").arg(p.speed, 0, 'f', 2)
+            : QString("measuring\u2026");
+
+        const QString remaining = p.estimatedRemainingSec() >= 0.0
+            ? duration(p.estimatedRemainingSec())
+            : QString("estimating\u2026");
+
+        progress.setLabelText(QString(
+            "Rendering  %1%%\n\n"
+            "%2 of %3 rendered\n"
+            "%4  \u00b7  %5 fps\n\n"
+            "Elapsed %6  \u00b7  about %7 remaining\n"
+            "Output so far: %8")
+            .arg(static_cast<int>(p.fraction * 100))
+            .arg(duration(p.renderedSec), duration(p.totalSec))
+            .arg(speedText)
+            .arg(p.fps, 0, 'f', 0)
+            .arg(duration(p.elapsedSec), remaining)
+            .arg(size(p.outputBytes)));
 
         // Keeps the dialog responsive: the export loop blocks on ffmpeg's output,
         // so without pumping events here the Cancel button would never repaint,
@@ -1313,6 +1346,21 @@ void MainWindow::onExportClicked() {
     });
 
     progress.close();
+
+    if (ok) {
+        // Reported on success because it is the one moment the figure is
+        // actually useful: it makes the next settings decision an informed one
+        // rather than a guess.
+        const double took = exportElapsed.elapsed() / 1000.0;
+        const double ratio = m_project.durationSec() > 0.0 ? m_project.durationSec() / std::max(0.001, took) : 0.0;
+        statusBar()->showMessage(
+            QString("Exported %1 in %2  (%3x realtime)")
+                .arg(QFileInfo(options.outputPath).fileName())
+                .arg(took >= 60 ? QString("%1m %2s").arg(int(took) / 60).arg(int(took) % 60)
+                                : QString("%1s").arg(took, 0, 'f', 1))
+                .arg(ratio, 0, 'f', 2),
+            12000);
+    }
 
     if (!ok) {
         if (exporter.errorMessage() == "Export cancelled.") return; // their own choice; no alarm needed

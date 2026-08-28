@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QElapsedTimer>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QTemporaryFile>
@@ -482,6 +483,15 @@ QString FFmpegExporter::resolveFfmpegPath() {
 
 bool FFmpegExporter::exportProject(const Project& project, const Options& options,
                                    ProgressFn onProgress) {
+    // Adapts the plain callback onto the detailed one, so there is a single
+    // implementation rather than two that can drift apart.
+    return exportProject(project, options, [&](const Progress& p) {
+        return onProgress ? onProgress(p.fraction) : true;
+    });
+}
+
+bool FFmpegExporter::exportProject(const Project& project, const Options& options,
+                                   DetailedProgressFn onProgress) {
     m_error.clear();
 
     if (options.outputPath.isEmpty()) {
@@ -581,6 +591,18 @@ bool FFmpegExporter::exportProject(const Project& project, const Options& option
     QString tail;
     bool cancelled = false;
 
+    // Elapsed time is measured here rather than inferred from ffmpeg's own
+    // counters, which only start once encoding begins and so omit the
+    // filter-graph setup the user is already waiting through.
+    QElapsedTimer wallClock;
+    wallClock.start();
+
+    // Retained so the final 100% callback can carry the real figures forward.
+    // Building a fresh Progress there reported zero speed and zero frames,
+    // which made the dialog blank its own numbers at the very moment they were
+    // most worth reading.
+    Progress lastProgress;
+
     while (process.state() != QProcess::NotRunning) {
         process.waitForReadyRead(200);
         const QString chunk = QString::fromUtf8(process.readAll());
@@ -590,15 +612,39 @@ bool FFmpegExporter::exportProject(const Project& project, const Options& option
             // progress lines, and all that's wanted on failure is the end of it.
             if (tail.size() > 8000) tail = tail.right(6000);
 
-            // -progress emits out_time_us=<microseconds> once per update.
-            int idx = chunk.lastIndexOf("out_time_us=");
-            if (idx >= 0 && onProgress) {
-                const int lineEnd = chunk.indexOf('\n', idx);
-                const QString value = chunk.mid(idx + 12, lineEnd < 0 ? -1 : lineEnd - idx - 12).trimmed();
+            // -progress emits a block of key=value lines per update. The last
+            // value of each key in this chunk is the most recent one; reading
+            // them all costs nothing beyond the parse and turns the bar into
+            // something informative.
+            auto lastValue = [&chunk](const QString& key) -> QString {
+                const int idx = chunk.lastIndexOf(key);
+                if (idx < 0) return QString();
+                const int from = idx + key.size();
+                const int lineEnd = chunk.indexOf('\n', from);
+                return chunk.mid(from, lineEnd < 0 ? -1 : lineEnd - from).trimmed();
+            };
+
+            if (onProgress && chunk.contains("out_time_us=")) {
                 bool ok = false;
-                const qlonglong us = value.toLongLong(&ok);
+                const qlonglong us = lastValue("out_time_us=").toLongLong(&ok);
                 if (ok && us >= 0) {
-                    if (!onProgress(std::clamp(us / 1e6 / total, 0.0, 1.0))) {
+                    Progress p;
+                    p.renderedSec = us / 1e6;
+                    p.totalSec = total;
+                    p.fraction = std::clamp(p.renderedSec / total, 0.0, 1.0);
+                    p.elapsedSec = wallClock.elapsed() / 1000.0;
+                    p.frames = lastValue("frame=").toLongLong();
+                    p.fps = lastValue("fps=").toDouble();
+                    p.outputBytes = lastValue("total_size=").toLongLong();
+
+                    // "speed=" arrives with a trailing x, and reads N/A until
+                    // the first frames are through.
+                    QString speed = lastValue("speed=");
+                    if (speed.endsWith('x')) speed.chop(1);
+                    p.speed = speed.toDouble(); // 0 on N/A, which callers treat as unknown
+
+                    lastProgress = p;
+                    if (!onProgress(p)) {
                         cancelled = true;
                         break;
                     }
@@ -630,6 +676,17 @@ bool FFmpegExporter::exportProject(const Project& project, const Options& option
         return false;
     }
 
-    if (onProgress) onProgress(1.0);
+    if (onProgress) {
+        Progress done = lastProgress;
+        done.fraction = 1.0;
+        done.totalSec = total;
+        done.renderedSec = total;
+        done.elapsedSec = wallClock.elapsed() / 1000.0;
+        // Recomputed over the whole run rather than kept from the last update:
+        // this is the figure worth remembering, and an instantaneous sample
+        // taken as the encoder drains is not representative of it.
+        if (done.elapsedSec > 0.01) done.speed = total / done.elapsedSec;
+        onProgress(done);
+    }
     return true;
 }

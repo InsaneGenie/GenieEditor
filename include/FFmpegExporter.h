@@ -49,9 +49,39 @@ public:
 
     // Called with 0..1 as the render proceeds. Return false to cancel, which
     // terminates ffmpeg and removes the partial output file.
+    // What ffmpeg reports while rendering, beyond bare percentage.
+    //
+    // All of this already arrives on the -progress pipe; the exporter used to
+    // read out_time_us and throw the rest away. Surfacing it turns a bar that
+    // could be doing anything into something you can judge: whether an export
+    // is worth waiting for, and whether a settings change actually helped.
+    struct Progress {
+        double fraction = 0.0;      // 0..1, from out_time against project length
+        double renderedSec = 0.0;   // position within the output
+        double totalSec = 0.0;      // project length
+        double speed = 0.0;         // multiple of realtime, ffmpeg's own "speed="
+        double fps = 0.0;           // encoded frames per second
+        qint64 frames = 0;
+        qint64 outputBytes = 0;
+        double elapsedSec = 0.0;
+
+        // Remaining time, estimated from the rate achieved SO FAR rather than
+        // instantaneously. Instantaneous speed swings wildly between scenes and
+        // produces an estimate that jumps around; averaging over the whole run
+        // gives a figure that settles. Negative when not yet estimable.
+        double estimatedRemainingSec() const {
+            if (fraction <= 0.001 || elapsedSec <= 0.5) return -1.0;
+            return elapsedSec * (1.0 - fraction) / fraction;
+        }
+    };
+
+    // Return false to cancel. The double overload is kept because it reads
+    // better at call sites that only want the bar.
     using ProgressFn = std::function<bool(double)>;
+    using DetailedProgressFn = std::function<bool(const Progress&)>;
 
     bool exportProject(const Project& project, const Options& options, ProgressFn onProgress = {});
+    bool exportProject(const Project& project, const Options& options, DetailedProgressFn onProgress);
 
     const QString& errorMessage() const { return m_error; }
 
