@@ -1283,6 +1283,10 @@ void MainWindow::onExportClicked() {
     // text it was constructed with -- without a minimum it grows and shrinks as
     // the numbers change width, which reads as flickering.
     progress.setMinimumWidth(360);
+    // The bar's own percentage is drawn over the fill and duplicates the label
+    // above it. One statement of the number is enough, and the label's is the
+    // legible one.
+    if (QProgressBar* bar = progress.findChild<QProgressBar*>()) bar->setTextVisible(false);
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(0);
     progress.setAutoClose(false);
@@ -1325,13 +1329,17 @@ void MainWindow::onExportClicked() {
             ? duration(p.estimatedRemainingSec())
             : QString("estimating\u2026");
 
+        // The percent sign goes in as part of the ARGUMENT, not as a literal in
+        // the format string. QString::arg has no %% escape -- it only replaces
+        // %1..%99 and leaves everything else alone -- so a literal "%%" here
+        // survives into the output as two characters.
         progress.setLabelText(QString(
-            "Rendering  %1%%\n\n"
+            "Rendering  %1\n\n"
             "%2 of %3 rendered\n"
             "%4  \u00b7  %5 fps\n\n"
             "Elapsed %6  \u00b7  about %7 remaining\n"
             "Output so far: %8")
-            .arg(static_cast<int>(p.fraction * 100))
+            .arg(QString::number(static_cast<int>(p.fraction * 100)) + "%")
             .arg(duration(p.renderedSec), duration(p.totalSec))
             .arg(speedText)
             .arg(p.fps, 0, 'f', 0)
