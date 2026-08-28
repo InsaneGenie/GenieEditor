@@ -161,31 +161,39 @@ void drawIcon(QPainter& p, Theme::Icon which, const QColor& c) {
 
     case I::Undo:
     case I::Redo: {
-        // A curved arrow doubling back on itself. Drawn as an arc plus a
-        // two-stroke head rather than a filled glyph, so it matches the weight
-        // of the stroked icons beside it in the toolbar.
-        const bool forward = (which == I::Redo);
+        // A hooked arrow: a shaft sweeping round and back, with an open
+        // arrowhead at the end it returns to.
+        //
+        // Sized to fill the 24x24 grid the way the icons beside it do. The
+        // first attempt occupied only the middle third, which looked fine
+        // rendered large and collapsed into an unreadable sliver at the 17px
+        // the toolbar actually uses -- icons have to be judged at their real
+        // size, not at a comfortable one.
+        QPainterPath shaft;
+        shaft.moveTo(7.5, 10.5);              // arrow tip end, left
+        shaft.lineTo(14.0, 10.5);             // across the top
+        shaft.cubicTo(19.0, 10.5, 19.5, 18.0, 13.5, 18.0); // round and back down
+        shaft.lineTo(9.0, 18.0);
 
-        QPainterPath arc;
-        arc.moveTo(6, 13);
-        // Sweeps over the top and down the far side; the redo variant is the
-        // same shape mirrored about the icon's centre.
-        arc.cubicTo(6, 6, 18, 6, 18, 13);
-        if (forward) {
-            QTransform mirror;
-            mirror.translate(24, 0);
-            mirror.scale(-1, 1);
-            arc = mirror.map(arc);
-        }
-        strokePath(p, arc, c);
-
-        // Arrowhead at the tail the arrow travels back towards.
-        const double tipX = forward ? 18.0 : 6.0;
-        const double dir = forward ? 1.0 : -1.0;
+        // Open chevron rather than a filled triangle, matching the stroked
+        // weight of Split and Pin.
         QPainterPath head;
-        head.moveTo(tipX - dir * 4.0, 10.0);
-        head.lineTo(tipX, 13.5);
-        head.lineTo(tipX - dir * 4.0, 16.0);
+        head.moveTo(11.0, 6.5);
+        head.lineTo(7.0, 10.5);
+        head.lineTo(11.0, 14.5);
+
+        if (which == I::Redo) {
+            // Mirrored about the grid's centre line, so redo is the exact
+            // reflection of undo rather than a separately drawn shape that
+            // might not match.
+            QTransform mirror;
+            mirror.translate(kGrid, 0);
+            mirror.scale(-1, 1);
+            shaft = mirror.map(shaft);
+            head = mirror.map(head);
+        }
+
+        strokePath(p, shaft, c);
         strokePath(p, head, c);
         break;
     }
