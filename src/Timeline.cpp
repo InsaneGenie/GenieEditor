@@ -4,6 +4,7 @@
 
 #include <QPainter>
 #include <QInputDialog>
+#include <limits>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QFontMetrics>
@@ -1687,6 +1688,18 @@ void Timeline::deleteSelectedClips() {
 }
 
 void Timeline::keyPressEvent(QKeyEvent* event) {
+    // Checked before the unmodified shortcuts below, so Ctrl+combinations are
+    // never mistaken for a bare key.
+    if (event->modifiers() & Qt::ControlModifier) {
+        switch (event->key()) {
+        case Qt::Key_C: copySelection();      event->accept(); return;
+        case Qt::Key_X: cutSelection();       event->accept(); return;
+        case Qt::Key_V: pasteAtPlayhead();    event->accept(); return;
+        case Qt::Key_D: duplicateSelection(); event->accept(); return;
+        default: break;
+        }
+    }
+
     if (event->key() == Qt::Key_M) {
         togglePinAtPlayhead();
         return;
@@ -1759,6 +1772,28 @@ void Timeline::contextMenuEvent(QContextMenuEvent* event) {
 
     menu.addSeparator();
 
+    // Shortcuts are shown rather than merely bound: an editor's clipboard keys
+    // are guessable, but "which one duplicates in place" is not, and a menu is
+    // where people look to find out.
+    QAction* copyAct = menu.addAction("Copy");
+    copyAct->setShortcut(QKeySequence::Copy);
+    connect(copyAct, &QAction::triggered, this, [this] { copySelection(); });
+
+    QAction* cutAct = menu.addAction("Cut");
+    cutAct->setShortcut(QKeySequence::Cut);
+    connect(cutAct, &QAction::triggered, this, [this] { cutSelection(); });
+
+    QAction* pasteAct = menu.addAction("Paste at Playhead");
+    pasteAct->setShortcut(QKeySequence::Paste);
+    pasteAct->setEnabled(hasClipboardContent());
+    connect(pasteAct, &QAction::triggered, this, [this] { pasteAtPlayhead(); });
+
+    QAction* dupAct = menu.addAction("Duplicate");
+    dupAct->setShortcut(QKeySequence("Ctrl+D"));
+    connect(dupAct, &QAction::triggered, this, [this] { duplicateSelection(); });
+
+    menu.addSeparator();
+
     // Split is MainWindow's to perform — it owns the follow-up work — so this
     // asks rather than acts, using the same signal the toolbar button sends.
     QAction* split = menu.addAction("Split at Playhead");
@@ -1808,3 +1843,146 @@ void Timeline::applySpeedToSelection(double speed) {
     emit projectModified();
 }
 
+
+// --- Clipboard ---------------------------------------------------------------
+//
+// Copy records each clip relative to the group: its time offset from the
+// earliest clip, and its track offset within its own type. Paste then rebuilds
+// the group at the playhead, on the track the selection anchors to.
+//
+// Track offsets are counted WITHIN a type for the same reason cross-track
+// dragging counts them that way: tracks are stored in creation order and types
+// interleave, so a raw index offset from Video 1 can land on an audio track.
+
+void Timeline::copySelection() {
+    if (!m_project || m_selectedClipKeys.isEmpty()) return;
+
+    QVector<ClipboardEntry> entries;
+    double earliest = std::numeric_limits<double>::max();
+    int topOrdinal = std::numeric_limits<int>::max();
+
+    for (qint64 key : m_selectedClipKeys) {
+        const int t = static_cast<int>(key >> 32);
+        const int c = static_cast<int>(key & 0xffffffffLL);
+        if (t < 0 || t >= m_project->tracks.size()) continue;
+        const auto& clips = m_project->tracks[t].clips;
+        if (c < 0 || c >= clips.size()) continue;
+
+        ClipboardEntry entry;
+        entry.clip = clips[c];
+        entry.trackType = m_project->tracks[t].type;
+        entry.typeOrdinalOffset = sameTypeOrdinal(t);
+        entry.timeOffsetSec = clips[c].trackPosSec;
+        entries.push_back(entry);
+
+        earliest = std::min(earliest, clips[c].trackPosSec);
+        topOrdinal = std::min(topOrdinal, entry.typeOrdinalOffset);
+    }
+    if (entries.isEmpty()) return;
+
+    // Rebased so the group's own shape is what is stored, independent of where
+    // it happened to be sitting.
+    for (ClipboardEntry& e : entries) {
+        e.timeOffsetSec -= earliest;
+        e.typeOrdinalOffset -= topOrdinal;
+    }
+
+    m_clipboard = entries;
+}
+
+void Timeline::cutSelection() {
+    if (!m_project || m_selectedClipKeys.isEmpty()) return;
+    copySelection();
+    deleteSelectedClips(); // already emits clipDeleted and projectModified
+}
+
+void Timeline::pasteAtPlayhead() {
+    if (!m_project || m_clipboard.isEmpty()) return;
+
+    // Where the group lands: the TOPMOST selected track of each type.
+    //
+    // Deliberately the minimum rather than any convenient member of the
+    // selection. Copy stores each clip's offset from the topmost track in the
+    // group, so paste has to anchor to the topmost track too or the offsets are
+    // applied from the wrong place -- and taking an arbitrary element of a QSet
+    // means the anchor changes between runs for no visible reason. With a
+    // two-track selection anchored to the lower track, every offset pushed past
+    // the last track of that type and the whole group collapsed onto one.
+    int anchorOrdinalByType[3] = {-1, -1, -1};
+    for (qint64 key : m_selectedClipKeys) {
+        const int t = static_cast<int>(key >> 32);
+        if (t < 0 || t >= m_project->tracks.size()) continue;
+        const int typeIndex = static_cast<int>(m_project->tracks[t].type);
+        const int ordinal = sameTypeOrdinal(t);
+        if (anchorOrdinalByType[typeIndex] < 0 || ordinal < anchorOrdinalByType[typeIndex]) {
+            anchorOrdinalByType[typeIndex] = ordinal;
+        }
+    }
+
+    QSet<qint64> pasted;
+    bool changed = false;
+
+    for (const ClipboardEntry& entry : m_clipboard) {
+        const int typeIndex = static_cast<int>(entry.trackType);
+        const int base = anchorOrdinalByType[typeIndex] >= 0 ? anchorOrdinalByType[typeIndex] : 0;
+
+        int destTrack = trackForSameTypeOrdinal(entry.trackType, base + entry.typeOrdinalOffset);
+        // Pasting a two-track group onto the last track would otherwise drop
+        // half of it. Falling back to the deepest track of that type keeps
+        // every clip, at the cost of collapsing the group's layering -- losing
+        // the arrangement is better than losing the clips.
+        if (destTrack < 0) {
+            for (int i = m_project->tracks.size() - 1; i >= 0; --i) {
+                if (m_project->tracks[i].type == entry.trackType) { destTrack = i; break; }
+            }
+        }
+        if (destTrack < 0) continue; // no track of this type exists at all
+
+        Clip copy = entry.clip;
+        copy.trackPosSec = std::max(0.0, m_playheadSec + entry.timeOffsetSec);
+
+        m_project->tracks[destTrack].clips.push_back(copy);
+        pasted.insert(clipKey(destTrack, m_project->tracks[destTrack].clips.size() - 1));
+        changed = true;
+    }
+    if (!changed) return;
+
+    // Selecting what was just pasted makes the next action -- nudge, delete,
+    // paste again -- apply to it, and is the only visual confirmation that
+    // anything happened when the paste lands off-screen.
+    m_selectedClipKeys = pasted;
+
+    updateGeometry(); // the project may now be longer
+    update();
+    emit clipsMovedBetweenTracks(); // clips appeared on tracks: re-sync playback
+    emit projectModified();
+}
+
+void Timeline::duplicateSelection() {
+    if (!m_project || m_selectedClipKeys.isEmpty()) return;
+
+    // Duplicate is copy+paste that does NOT disturb the clipboard, so it can be
+    // used repeatedly without losing whatever was copied earlier.
+    const QVector<ClipboardEntry> saved = m_clipboard;
+    copySelection();
+
+    // Placed immediately after the selection rather than at the playhead --
+    // that is what makes it a duplicate rather than another paste.
+    double latestEnd = 0.0;
+    for (qint64 key : m_selectedClipKeys) {
+        const int t = static_cast<int>(key >> 32);
+        const int c = static_cast<int>(key & 0xffffffffLL);
+        if (t < 0 || t >= m_project->tracks.size()) continue;
+        const auto& clips = m_project->tracks[t].clips;
+        if (c < 0 || c >= clips.size()) continue;
+        latestEnd = std::max(latestEnd, clips[c].trackPosSec + clips[c].durationSec());
+    }
+
+    const double savedPlayhead = m_playheadSec;
+    m_playheadSec = latestEnd;
+    pasteAtPlayhead();
+    m_playheadSec = savedPlayhead;
+
+    m_clipboard = saved;
+    update();
+}

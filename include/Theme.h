@@ -100,6 +100,7 @@ enum class Icon {
     Volume, VolumeMute,
     Search, FolderUp, Folder, Trash, Eye, EyeOff, Clear, Pin,
     Keyframe, KeyframeFilled, PinFilled, ChevronDown, ChevronRight,
+    Undo, Redo,
 };
 
 // `color` defaults to Theme::text() when left invalid.

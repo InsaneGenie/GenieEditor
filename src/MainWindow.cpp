@@ -182,6 +182,38 @@ void MainWindow::buildUi() {
     // The QAction is still owned by MainWindow and registered on the window
     // below, so Ctrl+K keeps working from anywhere — including when the
     // Timeline dock is floated into its own window or closed entirely.
+    // Undo/redo first in the row, matching where every other editor puts them.
+    // Application-scoped shortcuts so they work regardless of which dock has
+    // focus -- an undo that only fires when the timeline happens to be focused
+    // is an undo people stop trusting.
+    m_undoAction = new QAction(Theme::icon(Theme::Icon::Undo, Theme::textDim()), "Undo", this);
+    m_undoAction->setShortcut(QKeySequence::Undo);
+    m_undoAction->setShortcutContext(Qt::ApplicationShortcut);
+    m_undoAction->setEnabled(false);
+    connect(m_undoAction, &QAction::triggered, this, &MainWindow::onUndo);
+    addAction(m_undoAction);
+
+    m_redoAction = new QAction(Theme::icon(Theme::Icon::Redo, Theme::textDim()), "Redo", this);
+    // Both conventions bound: Ctrl+Y is the Windows habit, Ctrl+Shift+Z the one
+    // people bring from other editors. Costs nothing to accept both.
+    m_redoAction->setShortcuts({QKeySequence::Redo, QKeySequence("Ctrl+Y")});
+    m_redoAction->setShortcutContext(Qt::ApplicationShortcut);
+    m_redoAction->setEnabled(false);
+    connect(m_redoAction, &QAction::triggered, this, &MainWindow::onRedo);
+    addAction(m_redoAction);
+
+    auto* undoButton = new QToolButton();
+    undoButton->setDefaultAction(m_undoAction);
+    undoButton->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    undoButton->setIconSize(QSize(17, 17));
+    undoButton->setCursor(Qt::PointingHandCursor);
+
+    auto* redoButton = new QToolButton();
+    redoButton->setDefaultAction(m_redoAction);
+    redoButton->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    redoButton->setIconSize(QSize(17, 17));
+    redoButton->setCursor(Qt::PointingHandCursor);
+
     m_splitAction = new QAction(Theme::icon(Theme::Icon::Split, Theme::textDim()), "Split", this);
     m_splitAction->setToolTip("Split the selected clips at the playhead  (Ctrl+K)");
     m_splitAction->setShortcut(QKeySequence("Ctrl+K"));
@@ -223,6 +255,8 @@ void MainWindow::buildUi() {
     auto* stripLayout = new QHBoxLayout(timelineToolStrip);
     stripLayout->setContentsMargins(7, 4, 7, 4);
     stripLayout->setSpacing(4);
+    stripLayout->addWidget(undoButton);
+    stripLayout->addWidget(redoButton);
     stripLayout->addWidget(splitButton);
     stripLayout->addWidget(pinButton);
 
@@ -577,6 +611,11 @@ void MainWindow::buildUi() {
     // importing, adding or removing tracks, overlay edits — mark themselves
     // where they happen.
     connect(m_timeline, &Timeline::projectModified, this, &MainWindow::markProjectDirty);
+    // One snapshot per announced edit. Timeline emits this once per completed
+    // gesture -- on mouse release rather than per mouse-move -- so a drag is a
+    // single undo step rather than several hundred.
+    connect(m_timeline, &Timeline::projectModified, this,
+            [this] { recordUndoState("Timeline Edit"); });
     // Transcript timestamps are RULER positions, so moving, trimming or
     // splitting a clip changes them even though the words themselves are
     // untouched. Without this the panel keeps showing where the dialogue used
@@ -699,6 +738,12 @@ void MainWindow::buildMenus() {
 
     // Standard "View" menu for toggling dock/toolbar visibility back on if
     // the user closes one — otherwise a closed dock has no way to reopen.
+    // An Edit menu, because undo/redo are the two actions people look for in a
+    // menu bar before they look anywhere else.
+    auto* editMenu = menuBar()->addMenu("&Edit");
+    editMenu->addAction(m_undoAction);
+    editMenu->addAction(m_redoAction);
+
     auto* viewMenu = menuBar()->addMenu("&View");
     viewMenu->addAction(m_playerDock->toggleViewAction());
     viewMenu->addAction(m_transcriptDock->toggleViewAction());
@@ -789,6 +834,7 @@ void MainWindow::onImportClicked() {
 
 void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, double trackPosSec) {
     markProjectDirty();
+    recordUndoState("Import Video");
     scheduleTranscriptionScan(); // a new source file may need transcribing
     // Fall back to the primary video track if the target isn't actually a
     // valid video track (e.g. called with a stale/out-of-range index).
@@ -894,6 +940,7 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
 
 void MainWindow::importOverlayFileAt(const QString& path, int overlayTrackIndex, double trackPosSec) {
     markProjectDirty();
+    recordUndoState("Add Overlay");
     // Fall back to the first existing Overlay track, or create one if none
     // exists yet — avoids a dead-end where dropping an overlay image before
     // ever clicking "+ Overlay Track" would otherwise silently do nothing.
@@ -1050,6 +1097,7 @@ void MainWindow::setupAudioPlayerForTrack(int trackIndex) {
 
 void MainWindow::importAudioOnlyFileAt(const QString& path, int trackIndex, double trackPosSec) {
     markProjectDirty();
+    recordUndoState("Import Audio");
     scheduleTranscriptionScan(); // a new source file may need transcribing
     // Fall back to Audio 1 if the drop landed somewhere that isn't actually
     // an audio track (e.g. dropped onto the video lane, or the ruler).
@@ -2631,6 +2679,12 @@ void MainWindow::adoptLoadedProject(double playheadSec, double pixelsPerSecond) 
     // definition no unsaved changes yet.
     m_projectDirty = false;
     updateWindowTitle();
+
+    // History starts fresh with the newly loaded project as its baseline.
+    // Carrying the previous project's states over would let undo walk back into
+    // a different project entirely.
+    m_undoStack.reset(m_project);
+    updateUndoActions();
 }
 
 void MainWindow::regenerateAllClipVisuals() {
@@ -2701,4 +2755,84 @@ void MainWindow::updateKlipyMenuHint() {
     // The menu entry says WHY it is empty, so someone who opens it out of
     // curiosity understands the panel is waiting on a key rather than failing.
     m_klipyViewAction->setText(hasKey ? "GIFs" : "GIFs (needs a free Klipy API key)");
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo
+// ---------------------------------------------------------------------------
+
+void MainWindow::recordUndoState(const QString& label) {
+    // Restoring a state is itself a project change, and it emits the same
+    // signals an edit does. Recording it would push the restored state on as a
+    // new entry, which discards the redo branch and makes undo un-redoable.
+    if (m_restoringUndoState) return;
+    m_undoStack.record(m_project, label);
+    updateUndoActions();
+}
+
+void MainWindow::restoreProjectState(const Project& state) {
+    m_restoringUndoState = true;
+
+    // Whether the audio machinery has to be rebuilt. Each AudioPlayer owns an
+    // mpv instance, so tearing them down and recreating them costs enough to
+    // be felt -- and for the common case (a clip moved, trimmed, deleted) the
+    // track list is identical and nothing needs rebuilding at all.
+    bool structureChanged = state.tracks.size() != m_project.tracks.size();
+    if (!structureChanged) {
+        for (int i = 0; i < state.tracks.size(); ++i) {
+            if (state.tracks[i].type != m_project.tracks[i].type) { structureChanged = true; break; }
+        }
+    }
+
+    m_project = state;
+
+    if (structureChanged) {
+        // adoptLoadedProject rebuilds players, overlays and transcript tabs.
+        // Current playhead and zoom are passed straight back in: undo restores
+        // what the project is, not where you were looking at it.
+        adoptLoadedProject(m_currentTimelineSec, m_timeline->pixelsPerSecond());
+    } else {
+        m_timeline->clearSelection(); // selection keys index into clip vectors that just changed
+        refreshTrackViews();
+        seekTimeline(m_currentTimelineSec);
+    }
+
+    m_restoringUndoState = false;
+
+    // Marked dirty explicitly: an undo genuinely leaves the file on disk out of
+    // step with what is on screen, even though it moved backwards.
+    m_projectDirty = true;
+    updateWindowTitle();
+    updateUndoActions();
+}
+
+void MainWindow::onUndo() {
+    if (!m_undoStack.canUndo()) return;
+    const QString what = m_undoStack.undoLabel();
+    restoreProjectState(m_undoStack.undo());
+    statusBar()->showMessage(what.isEmpty() ? QString("Undone")
+                                            : QString("Undone: %1").arg(what), 3000);
+}
+
+void MainWindow::onRedo() {
+    if (!m_undoStack.canRedo()) return;
+    const QString what = m_undoStack.redoLabel();
+    restoreProjectState(m_undoStack.redo());
+    statusBar()->showMessage(what.isEmpty() ? QString("Redone")
+                                            : QString("Redone: %1").arg(what), 3000);
+}
+
+void MainWindow::updateUndoActions() {
+    if (m_undoAction) {
+        m_undoAction->setEnabled(m_undoStack.canUndo());
+        const QString what = m_undoStack.undoLabel();
+        // The menu names what will happen, which is the difference between a
+        // confident undo and a cautious one.
+        m_undoAction->setText(what.isEmpty() ? "Undo" : QString("Undo %1").arg(what));
+    }
+    if (m_redoAction) {
+        m_redoAction->setEnabled(m_undoStack.canRedo());
+        const QString what = m_undoStack.redoLabel();
+        m_redoAction->setText(what.isEmpty() ? "Redo" : QString("Redo %1").arg(what));
+    }
 }

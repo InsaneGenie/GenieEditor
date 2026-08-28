@@ -1,4 +1,5 @@
 #include "Theme.h"
+#include <QTransform>
 
 #include <QApplication>
 #include <QFontDatabase>
@@ -155,6 +156,37 @@ void drawIcon(QPainter& p, Theme::Icon which, const QColor& c) {
         strokePath(p, linePath(15.4, 15.4, 20.5, 20.5), c, 2.4);
         strokePath(p, linePath(7.5, 10.5, 13.5, 10.5), c);
         if (which == I::ZoomIn) strokePath(p, linePath(10.5, 7.5, 10.5, 13.5), c);
+        break;
+    }
+
+    case I::Undo:
+    case I::Redo: {
+        // A curved arrow doubling back on itself. Drawn as an arc plus a
+        // two-stroke head rather than a filled glyph, so it matches the weight
+        // of the stroked icons beside it in the toolbar.
+        const bool forward = (which == I::Redo);
+
+        QPainterPath arc;
+        arc.moveTo(6, 13);
+        // Sweeps over the top and down the far side; the redo variant is the
+        // same shape mirrored about the icon's centre.
+        arc.cubicTo(6, 6, 18, 6, 18, 13);
+        if (forward) {
+            QTransform mirror;
+            mirror.translate(24, 0);
+            mirror.scale(-1, 1);
+            arc = mirror.map(arc);
+        }
+        strokePath(p, arc, c);
+
+        // Arrowhead at the tail the arrow travels back towards.
+        const double tipX = forward ? 18.0 : 6.0;
+        const double dir = forward ? 1.0 : -1.0;
+        QPainterPath head;
+        head.moveTo(tipX - dir * 4.0, 10.0);
+        head.lineTo(tipX, 13.5);
+        head.lineTo(tipX - dir * 4.0, 16.0);
+        strokePath(p, head, c);
         break;
     }
 

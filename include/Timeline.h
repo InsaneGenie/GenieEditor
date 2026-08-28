@@ -275,6 +275,35 @@ private:
     void deleteClip(int trackIndex, int clipIndex);
     void deleteSelectedClips();
 
+    // --- Clipboard ----------------------------------------------------------
+    // Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D over the timeline. Internal rather than
+    // the system clipboard: what is being copied is an edit decision -- a
+    // reference to a source file with in/out points and a set of transforms --
+    // which means nothing to any other application, and would be actively
+    // wrong to paste into one.
+    void copySelection();
+    void cutSelection();
+    void pasteAtPlayhead();
+    void duplicateSelection();
+
+    bool hasClipboardContent() const { return !m_clipboard.isEmpty(); }
+
+    // One copied clip, described relative to the group rather than absolutely.
+    //
+    // Positions are stored as offsets from the EARLIEST clip in the selection,
+    // and tracks as an offset within their own type, so a paste can land the
+    // group at the playhead on whatever track is current while preserving both
+    // the spacing between clips and which of them sat above which. Storing
+    // absolute positions would paste everything back exactly where it was
+    // copied from, which is never what is wanted.
+    struct ClipboardEntry {
+        Clip clip;
+        TrackType trackType = TrackType::Video;
+        int typeOrdinalOffset = 0; // relative to the topmost track in the copy
+        double timeOffsetSec = 0.0; // relative to the earliest clip in the copy
+    };
+    QVector<ClipboardEntry> m_clipboard;
+
     Project* m_project = nullptr;
     double m_playheadSec = 0.0;
     double m_pxPerSec = 60.0; // zoom level

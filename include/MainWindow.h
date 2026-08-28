@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QSet>
 #include "Project.h"
+#include "UndoStack.h"
 
 class PlayerWidget;
 class AudioPlayer;
@@ -63,6 +64,10 @@ private slots:
     void onThumbnailDetailNeeded(int trackIndex, int clipIndex, int desiredFullFileFrameCount);
     void onTimelineZoomAnchorChanged(double anchorSec, int oldPixelX);
     void onClipDeleted();
+
+    // --- Undo / redo --------------------------------------------------------
+    void onUndo();
+    void onRedo();
 
     // --- Project files ------------------------------------------------------
     void onNewProject();
@@ -214,6 +219,20 @@ private:
 
     // Marks the project as having unsaved changes and refreshes the title bar.
     // Cheap and idempotent, so it's safe to call from anything that mutates.
+    // Snapshots the project into the undo stack. Called after an edit rather
+    // than before, so every mutation site announces itself the same way it
+    // already does for the dirty flag rather than needing a matching
+    // "about to change" hook.
+    void recordUndoState(const QString& label);
+
+    // Puts a restored project back in place and re-syncs whatever depends on
+    // it. Rebuilds the audio players ONLY when the track structure changed --
+    // each one owns an mpv instance, and recreating them for an ordinary clip
+    // move would make undo visibly slow.
+    void restoreProjectState(const Project& state);
+
+    void updateUndoActions();
+
     void markProjectDirty();
     void updateWindowTitle();
 
@@ -372,6 +391,14 @@ private:
     // Where this project lives on disk, empty for one that has never been
     // saved. Drives the title bar, and decides whether Save can write straight
     // out or has to ask for a location first.
+    UndoStack m_undoStack;
+    QAction* m_undoAction = nullptr;
+    QAction* m_redoAction = nullptr;
+    // Set while an undo or redo is being applied, so the resulting
+    // projectModified does not record the restored state as a fresh edit --
+    // which would make undo push a new entry and redo unreachable.
+    bool m_restoringUndoState = false;
+
     QString m_currentProjectPath;
     bool m_projectDirty = false;
     class QMenu* m_recentMenu = nullptr;

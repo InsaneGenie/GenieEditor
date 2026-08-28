@@ -69,6 +69,8 @@ add_executable(GenieEditor
     src/Timeline.cpp
     include/Timeline.h
     src/Project.cpp
+    src/UndoStack.cpp
+    include/UndoStack.h
     include/Project.h
     src/ProjectSerializer.cpp
     include/ProjectSerializer.h
