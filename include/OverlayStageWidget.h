@@ -34,6 +34,17 @@ public:
     // the surface is hidden.
     void attachTo(QWidget* surface);
 
+    // Tells the stage where the VIDEO sits inside that surface, so its handles
+    // line up with the picture rather than with the widget.
+    //
+    // mpv letterboxes the video to preserve aspect, and the black bars belong
+    // to the widget, not the frame. Mapping a normalised position against the
+    // whole surface therefore puts a handle somewhere the export will not put
+    // the overlay -- the further the panel's shape is from the video's, the
+    // bigger the discrepancy, and at some sizes it pushes an overlay off the
+    // visible frame entirely.
+    void setVideoRect(const QRect& rectInSurface);
+
     // Points the stage at a clip. Anything that isn't an overlay clip hides it,
     // so the handles never appear over footage they can't affect.
     void setTarget(Project* project, int trackIndex, int clipIndex);
@@ -100,7 +111,13 @@ private:
     int m_clipIndex = -1;
     double m_playheadSec = 0.0;
 
+    // The video's rectangle, or the whole widget when not yet known.
+    QRectF videoRectF() const;
+
     QWidget* m_surface = nullptr;
+    // Where the video sits within m_surface. Empty means "not known yet", in
+    // which case the whole surface is used, matching the old behaviour.
+    QRect m_videoRect;
 
     // Where the box was last painted, so a move repaints both the old and new
     // positions and doesn't leave the previous outline behind.

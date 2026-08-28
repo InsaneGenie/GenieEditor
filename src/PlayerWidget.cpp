@@ -281,13 +281,51 @@ void PlayerWidget::setOverlay(int id, const QImage& image, int x, int y) {
               QString::number(stored.bytesPerLine())});
 }
 
-QSize PlayerWidget::overlayCanvasSize() const {
-    const QSize size = m_videoSurface->size();
+QSize PlayerWidget::videoSize() const {
+    if (!m_mpv) return QSize();
+    int64_t w = 0, h = 0;
+    // dwidth/dheight rather than width/height: these are the DISPLAY
+    // dimensions, so anamorphic footage reports the shape it is actually shown
+    // at rather than its stored pixel grid.
+    if (mpv_get_property(m_mpv, "dwidth", MPV_FORMAT_INT64, &w) < 0) return QSize();
+    if (mpv_get_property(m_mpv, "dheight", MPV_FORMAT_INT64, &h) < 0) return QSize();
+    if (w <= 0 || h <= 0) return QSize();
+    return QSize(static_cast<int>(w), static_cast<int>(h));
+}
+
+QSize PlayerWidget::overlayCanvasSize(QPoint* outOrigin) const {
+    if (outOrigin) *outOrigin = QPoint(0, 0);
+
+    const QSize surface = m_videoSurface->size();
     // Guard against the zero/degenerate size the surface reports before the
     // first layout pass — a divide or scale against that would produce a null
     // image and silently drop the overlay.
-    if (size.width() < 16 || size.height() < 16) return QSize(1280, 720);
-    return size;
+    if (surface.width() < 16 || surface.height() < 16) return QSize(1280, 720);
+
+    const QSize video = videoSize();
+    if (!video.isValid()) return surface; // nothing loaded; the surface is all there is
+
+    // Reproduce mpv's own letterboxing: it fits the video inside the surface
+    // preserving aspect, centred, with bars filling whatever is left over.
+    // Overlays are then positioned against that inner rectangle, so a fraction
+    // means the same thing here as it does in the export.
+    const double surfaceAspect = double(surface.width()) / surface.height();
+    const double videoAspect = double(video.width()) / video.height();
+
+    QSize fitted;
+    if (videoAspect > surfaceAspect) {
+        // Wider than the surface: full width, bars top and bottom.
+        fitted = QSize(surface.width(), std::max(1, int(surface.width() / videoAspect)));
+    } else {
+        // Taller: full height, bars left and right.
+        fitted = QSize(std::max(1, int(surface.height() * videoAspect)), surface.height());
+    }
+
+    if (outOrigin) {
+        *outOrigin = QPoint((surface.width() - fitted.width()) / 2,
+                            (surface.height() - fitted.height()) / 2);
+    }
+    return fitted;
 }
 
 void PlayerWidget::clearOverlay(int id) {

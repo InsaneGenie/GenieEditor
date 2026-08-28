@@ -82,7 +82,24 @@ public:
     // overlay-add places images in the video output's own coordinate space,
     // which is this surface. Normalised overlay positions get multiplied by
     // this to become concrete pixels.
-    QSize overlayCanvasSize() const;
+    // The rectangle overlay positions are measured against, in the surface's
+    // own pixels: WHERE THE VIDEO IS, not where the widget is.
+    //
+    // These differ whenever the panel's shape does not match the video's, which
+    // is almost always. mpv letterboxes the video inside the surface, so the
+    // black bars belong to the widget and not to the picture -- and an overlay
+    // placed as a fraction of the widget lands somewhere different from the
+    // same fraction of the video. Since the export measures against the output
+    // frame, that mismatch is exactly the preview and the export disagreeing,
+    // and it gets worse the further the panel is from the video's aspect.
+    //
+    // `outOrigin` receives the top-left of the video inside the surface, which
+    // the caller must add to any position it computes.
+    QSize overlayCanvasSize(QPoint* outOrigin = nullptr) const;
+
+    // The video's own pixel dimensions, or an invalid size when nothing is
+    // loaded yet.
+    QSize videoSize() const;
 
     // The native child widget mpv renders into. Exposed so OverlayStageWidget
     // can track its screen geometry — see that class's comment for why the

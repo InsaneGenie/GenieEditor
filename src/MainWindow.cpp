@@ -1921,7 +1921,18 @@ QImage MainWindow::renderOverlayBitmap(int trackIndex, int clipIndex, const Clip
 }
 
 void MainWindow::syncOverlaysToTimeline(double timelineSeconds) {
-    const QSize canvas = m_player->overlayCanvasSize();
+    // The video's rectangle within the surface, plus where that rectangle
+    // starts. Overlays are positioned against the VIDEO so that a given
+    // fraction means the same thing in the preview as it does in the export;
+    // the origin then shifts the result into surface coordinates, which is what
+    // mpv's overlay-add expects.
+    QPoint canvasOrigin;
+    const QSize canvas = m_player->overlayCanvasSize(&canvasOrigin);
+
+    // The drag handles have to measure against the same rectangle the
+    // compositor does, or grabbing an overlay would move it somewhere other
+    // than where it was drawn.
+    if (m_overlayStage) m_overlayStage->setVideoRect(QRect(canvasOrigin, canvas));
 
     for (int t = 0; t < m_project.tracks.size(); ++t) {
         if (m_project.tracks[t].type != TrackType::Overlay) continue;
@@ -1960,7 +1971,8 @@ void MainWindow::syncOverlaysToTimeline(double timelineSeconds) {
         // anything to composite.
         if (clip.anim.opacity.valueAt(localSec) <= 0.002) { hideOverlay(); continue; }
 
-        m_player->setOverlay(overlayId, bitmap, pos.x(), pos.y());
+        m_player->setOverlay(overlayId, bitmap,
+                             pos.x() + canvasOrigin.x(), pos.y() + canvasOrigin.y());
         m_activeOverlayClipByTrack[t] = clipIdx;
     }
 }

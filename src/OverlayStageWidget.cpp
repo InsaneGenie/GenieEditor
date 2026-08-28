@@ -155,7 +155,11 @@ QPointF OverlayStageWidget::centrePx() const {
     const Clip* clip = targetClip();
     if (!clip) return QPointF();
     const double t = localSec();
-    return QPointF(width() * clip->anim.x.valueAt(t), height() * clip->anim.y.valueAt(t));
+    // Against the VIDEO rect, not the widget, so a handle sits where the export
+    // will actually draw the overlay.
+    const QRectF v = videoRectF();
+    return QPointF(v.x() + v.width() * clip->anim.x.valueAt(t),
+                   v.y() + v.height() * clip->anim.y.valueAt(t));
 }
 
 QSizeF OverlayStageWidget::halfExtentPx() const {
@@ -166,7 +170,7 @@ QSizeF OverlayStageWidget::halfExtentPx() const {
     if (source.isNull() || source.width() <= 0) return QSizeF();
 
     const double t = localSec();
-    const double w = width() * std::clamp(clip->anim.scale.valueAt(t), 0.005, 4.0);
+    const double w = videoRectF().width() * std::clamp(clip->anim.scale.valueAt(t), 0.005, 4.0);
     const double h = w * source.height() / source.width();
     return QSizeF(w / 2.0, h / 2.0);
 }
@@ -215,10 +219,14 @@ QPointF OverlayStageWidget::applySnapping(const QPointF& proposedCentre) {
     // Each candidate is (centre position that achieves it, guide line to draw).
     // Left/right edges are expressed as centre positions rather than edge
     // positions so the comparison is against one number, not two.
-    const double candX[3] = { half.width(), width() / 2.0, width() - half.width() };
-    const double guideX[3] = { 0.0, width() / 2.0, static_cast<double>(width()) };
-    const double candY[3] = { half.height(), height() / 2.0, height() - half.height() };
-    const double guideY[3] = { 0.0, height() / 2.0, static_cast<double>(height()) };
+    // Snap targets are the VIDEO's edges and centre. Snapping to the widget's
+    // edges would place an overlay against a black bar rather than against the
+    // picture, which is never what centring an overlay is meant to mean.
+    const QRectF v = videoRectF();
+    const double candX[3] = { v.left() + half.width(), v.center().x(), v.right() - half.width() };
+    const double guideX[3] = { v.left(), v.center().x(), v.right() };
+    const double candY[3] = { v.top() + half.height(), v.center().y(), v.bottom() - half.height() };
+    const double guideY[3] = { v.top(), v.center().y(), v.bottom() };
 
     double bestX = kSnapPx;
     for (int i = 0; i < 3; ++i) {
@@ -470,8 +478,12 @@ void OverlayStageWidget::mouseMoveEvent(QMouseEvent* event) {
 
     switch (m_activeGrip) {
     case Grip::Move: {
-        QPointF centre(( m_dragStartX * width()) + delta.x(),
-                       ( m_dragStartY * height()) + delta.y());
+        // Against the video rect, matching centrePx(): the drag start has to be
+        // converted from a normalised value the same way the handle was drawn,
+        // or the box jumps to a different place the moment you grab it.
+        const QRectF vr = videoRectF();
+        QPointF centre(vr.x() + m_dragStartX * vr.width() + delta.x(),
+                       vr.y() + m_dragStartY * vr.height() + delta.y());
 
         // Alt bypasses snapping, the usual escape hatch for placing something
         // deliberately just off an edge without fighting the magnet.
@@ -484,8 +496,12 @@ void OverlayStageWidget::mouseMoveEvent(QMouseEvent* event) {
 
         // Normalised before storing, so a drag means the same fraction of the
         // frame no matter how large the preview panel happens to be.
-        OverlayAnimation::applyValue(clip->anim.x, centre.x() / std::max(1, width()), t, key);
-        OverlayAnimation::applyValue(clip->anim.y, centre.y() / std::max(1, height()), t, key);
+        // And back out again against the same rect, so what is stored is a
+        // fraction OF THE VIDEO -- which is exactly what the export reads.
+        OverlayAnimation::applyValue(
+            clip->anim.x, (centre.x() - vr.x()) / std::max(1.0, vr.width()), t, key);
+        OverlayAnimation::applyValue(
+            clip->anim.y, (centre.y() - vr.y()) / std::max(1.0, vr.height()), t, key);
         break;
     }
     case Grip::ScaleTL:
@@ -550,4 +566,19 @@ void OverlayStageWidget::mouseReleaseEvent(QMouseEvent*) {
     // to composite at reduced quality while the pointer is down, so this is what
     // triggers the full-quality redraw once it's up.
     emit transformChanged();
+}
+
+
+void OverlayStageWidget::setVideoRect(const QRect& rectInSurface) {
+    if (m_videoRect == rectInSurface) return;
+    m_videoRect = rectInSurface;
+    update(); // the handles move even though nothing about the clip changed
+}
+
+QRectF OverlayStageWidget::videoRectF() const {
+    // Falls back to the whole widget when the video rect is unknown -- before
+    // the first frame loads there is nothing better to measure against, and the
+    // handles are hidden at that point anyway.
+    if (m_videoRect.isEmpty()) return QRectF(rect());
+    return QRectF(m_videoRect);
 }
