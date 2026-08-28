@@ -6,6 +6,12 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
+#include <QHash>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QFileInfo>
+#include <QDateTime>
+#include <limits>
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -27,8 +33,79 @@ constexpr int kMinBuckets = 2000;
 constexpr int kMaxBuckets = 400000;
 } // namespace
 
+namespace {
+
+// Decoded waveforms, keyed by file identity rather than path alone.
+//
+// Generating one means decoding the ENTIRE audio stream, which is by far the
+// most expensive thing this application does on import. It was also being done
+// more than once for the same audio: a video clip and its companion audio clip
+// share a source, splitting a clip gives both halves the same source, and
+// re-importing a file starts from scratch again. Every one of those decoded the
+// same samples over again, in parallel, competing with playback.
+//
+// Keyed on modification time and size as well as path, so re-exporting a file
+// and reopening the project picks up the new audio rather than a stale cache.
+struct WaveformCacheEntry {
+    WaveformData data;
+    qint64 modifiedMs = 0;
+    qint64 sizeBytes = 0;
+    int peakCount = 0;
+    quint64 lastUsed = 0;
+};
+
+QHash<QString, WaveformCacheEntry> g_waveformCache;
+QMutex g_waveformCacheMutex;
+quint64 g_waveformUseCounter = 0;
+
+// The arrays are large, so the cache is bounded and drops least-recently-used
+// entries. Exceeding it costs a re-decode, never a wrong result.
+constexpr int kMaxCachedWaveforms = 12;
+
+void trimWaveformCache() {
+    while (g_waveformCache.size() > kMaxCachedWaveforms) {
+        QString oldestKey;
+        quint64 oldest = std::numeric_limits<quint64>::max();
+        for (auto it = g_waveformCache.constBegin(); it != g_waveformCache.constEnd(); ++it) {
+            if (it->lastUsed < oldest) { oldest = it->lastUsed; oldestKey = it.key(); }
+        }
+        if (oldestKey.isEmpty()) break;
+        g_waveformCache.remove(oldestKey);
+    }
+}
+
+} // namespace
+
+void WaveformGenerator::clearCache() {
+    QMutexLocker lock(&g_waveformCacheMutex);
+    g_waveformCache.clear();
+}
+
 WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     WaveformData result;
+
+    // Captured BEFORE the resolution logic below overwrites peakCount with the
+    // count it actually chose. Storing the resolved value while looking up the
+    // requested one means the key never matches and the cache silently never
+    // hits -- which looks exactly like it working, only slowly.
+    const int requestedPeakCount = peakCount;
+
+    const QFileInfo probeInfo(path);
+    const qint64 modifiedMs = probeInfo.lastModified().toMSecsSinceEpoch();
+    const qint64 sizeBytes = probeInfo.size();
+    {
+        QMutexLocker lock(&g_waveformCacheMutex);
+        auto cached = g_waveformCache.find(path);
+        if (cached != g_waveformCache.end()
+            && cached->modifiedMs == modifiedMs
+            && cached->sizeBytes == sizeBytes
+            && cached->peakCount == requestedPeakCount) {
+            cached->lastUsed = ++g_waveformUseCounter;
+            // QVector is implicitly shared, so this hands back a refcount bump
+            // rather than copying several megabytes of samples.
+            return cached->data;
+        }
+    }
 
     AVFormatContext* fmtCtx = nullptr;
     const QByteArray pathUtf8 = path.toUtf8();
@@ -149,6 +226,13 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     if (bucketSamples > 0) {
         result.peaks.push_back(static_cast<float>(bucketMax));
         result.rms.push_back(static_cast<float>(std::sqrt(bucketEnergy / bucketSamples)));
+    }
+
+    if (!result.peaks.isEmpty()) {
+        QMutexLocker lock(&g_waveformCacheMutex);
+        g_waveformCache.insert(path, WaveformCacheEntry{
+            result, modifiedMs, sizeBytes, requestedPeakCount, ++g_waveformUseCounter});
+        trimWaveformCache();
     }
 
     av_frame_free(&frame);

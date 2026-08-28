@@ -90,6 +90,17 @@ private:
         QString currentLoadedPath;
         bool awaitingSeekAfterLoad = false;
         double pendingSeekSec = 0.0;
+
+        // A seek is ASYNCHRONOUS: positionSec() keeps reporting the old
+        // position until mpv completes it, typically for a good handful of
+        // 16ms ticks. Without this, every one of those ticks sees the same
+        // uncorrected drift and issues another seek -- around nine of them for
+        // a single desync -- and each restarts playback from its target, which
+        // is audible as the same fragment of sound playing over and over.
+        //
+        // Correction is suspended until the seek has had time to land.
+        QElapsedTimer sinceSeek;
+        bool seekInFlight = false;
     };
 
     void buildUi();
@@ -316,6 +327,46 @@ private:
     // scrollbar range needs to grow to reach newly added tracks.
     void refreshTrackViews();
 
+    // --- Playback drift correction ----------------------------------------
+    // The timeline clock is wall time and each mpv instance keeps its own, so
+    // they separate continuously. These govern how that gap is closed. See
+    // syncVideoToTimeline for why a rate nudge is used in preference to a seek.
+
+    // Below this, nothing is done. Without a dead zone the loop would chase
+    // sub-frame error forever, changing rate on every tick.
+    static constexpr double kDriftDeadZoneSec = 0.04;   // about one frame at 25fps
+
+    // Above this the gap is too large to close by rate and indicates a real
+    // desync -- a stall, a scrub, a clip change -- rather than accumulated
+    // drift. Seek instead.
+    //
+    // Video and audio differ deliberately. A video seek flushes the decoder and
+    // drops frames, so it is worth avoiding until the gap is large; an audio
+    // seek is close to imperceptible. Audio also matters more when it is wrong,
+    // because a quarter-second offset against picture is obvious lip-sync
+    // error, while the same offset in video alone is invisible.
+    static constexpr double kHardResyncSec = 1.5;
+    static constexpr double kAudioHardResyncSec = 0.25;
+
+    // Fraction of the remaining error corrected per tick. Chosen so the
+    // steady-state error lands INSIDE the dead zone for a plausible clock error
+    // -- too low and the loop settles at a permanent offset it never closes
+    // (0.08 leaves about 150ms), too high and it hunts.
+    static constexpr double kDriftGain = 0.4;
+
+    // Rate-change ceilings, which bound how fast an error can be closed.
+    // Video carries no audio on its player (aid=no), so a brisk correction is
+    // invisible. Audio is audible: mpv corrects pitch when changing tempo, but
+    // 1% is the point below which the change cannot be noticed at all.
+    static constexpr double kMaxVideoNudge = 0.08; // 8%
+    static constexpr double kMaxAudioNudge = 0.01; // 1%
+
+    // How long to leave a seek alone before judging the result. Comfortably
+    // longer than a keyframe seek takes, because the cost of waiting slightly
+    // too long is one extra tick of drift, while the cost of not waiting long
+    // enough is the seek storm this exists to prevent.
+    static constexpr int kSeekSettleMs = 400;
+
     Project m_project;
 
     // Where this project lives on disk, empty for one that has never been
@@ -385,6 +436,10 @@ private:
     QString m_currentLoadedPath;       // path of whatever file is actually loaded in the player right now
     bool m_awaitingSeekAfterLoad = false;
     double m_pendingSeekSec = 0.0;
+
+    // Video's equivalent of the per-track seek guard above; see the note there.
+    QElapsedTimer m_sinceVideoSeek;
+    bool m_videoSeekInFlight = false;
 
     // Per-overlay-track state: which clip (if any) is currently composited
     // for that track, so setOverlay/clearOverlay are only called on an

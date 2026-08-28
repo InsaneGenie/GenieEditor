@@ -52,8 +52,27 @@ void Timeline::setProject(Project* project) {
 }
 
 void Timeline::setPlayheadSec(double seconds) {
+    const double previous = m_playheadSec;
     m_playheadSec = seconds;
-    update();
+
+    // Repaint only when something would actually LOOK different.
+    //
+    // This is called on every master-clock tick -- 60 times a second during
+    // playback -- and update() repaints the entire widget: filmstrips, waveform
+    // envelopes, grid, markers, the lot. At a typical zoom of 60 px/s the
+    // playhead advances one pixel per second, so roughly 59 of every 60 of
+    // those repaints produced a pixel-identical frame. That is a large amount
+    // of work to do while also decoding video, and it is the kind of load that
+    // shows up as periodic hitching rather than steady slowness.
+    //
+    // Two things can change: the playhead's pixel column, and the timecode
+    // capsule, which reads to a tenth of a second. Repainting when either moves
+    // keeps both looking smooth while cutting the repaint rate by an order of
+    // magnitude at normal zoom levels.
+    const bool columnMoved = secToX(previous) != secToX(m_playheadSec);
+    const bool timecodeMoved =
+        static_cast<qint64>(previous * 10.0) != static_cast<qint64>(m_playheadSec * 10.0);
+    if (columnMoved || timecodeMoved) update();
 }
 
 void Timeline::setVerticalScrollOffset(int px) {

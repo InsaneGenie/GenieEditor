@@ -45,4 +45,11 @@ public:
     // clip copies the Clip struct but NOT the samples, so the higher resolution
     // costs one allocation per imported file rather than one per clip.
     static WaveformData generate(const QString& path, int peakCount = 0);
+
+    // Results are cached by file identity, because generating one decodes the
+    // whole audio stream and the same source is routinely asked for more than
+    // once -- a video clip and its companion audio share a file, and splitting
+    // a clip leaves both halves pointing at it. Entries invalidate themselves
+    // when the file changes; this is only for reclaiming memory.
+    static void clearCache();
 };

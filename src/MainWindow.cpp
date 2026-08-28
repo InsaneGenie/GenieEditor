@@ -1733,14 +1733,45 @@ void MainWindow::syncVideoToTimeline(double timelineSeconds) {
         // large jumps well above this threshold); mpv naturally stays in
         // sync during uninterrupted continuous playback, so there's no
         // benefit to correcting sub-second drift, only cost.
-        // Drift is measured in SOURCE seconds, which elapse faster than timeline
-        // seconds on a sped-up clip. Scaling the threshold keeps "0.75s of
-        // timeline" as the tolerance at every rate — a fixed source-second
-        // threshold would be four times stricter on a 4x clip and trigger
-        // constant corrective seeks.
-        const double drift = std::fabs(m_player->positionSec() - expectedSourceSec);
-        if (drift > 0.75 * clip.effectiveSpeed()) {
+        // --- Drift correction ---------------------------------------------
+        //
+        // The timeline clock is wall time; mpv keeps its own. They separate
+        // slowly and continuously, so ANY fixed threshold is reached eventually
+        // and then reached again, at a regular interval set by the drift rate.
+        // Correcting that with a seek flushes the decoder and drops frames, so
+        // the old behaviour produced a visible hitch on a metronome -- a glitch
+        // every N seconds, forever, with nothing obviously wrong in between.
+        //
+        // Nudging the playback RATE instead removes the periodicity rather than
+        // lengthening its period: a decoder running 1% fast closes a 200ms gap
+        // over twenty seconds without dropping a single frame, and the loop
+        // settles at zero error rather than sawtoothing up to the threshold.
+        //
+        // A seek is still the right answer for a genuine desync -- a stall, a
+        // clip change, a manual scrub -- where the gap is far too large to
+        // close by rate alone. That is what kHardResync distinguishes.
+        const double rate = clip.effectiveSpeed();
+        const double drift = m_player->positionSec() - expectedSourceSec; // signed: + is ahead
+
+        // A seek already issued has not necessarily taken effect yet, and until
+        // it does the drift reads exactly as it did before. Judging it now
+        // means issuing the same seek again, and again, for as long as mpv
+        // takes to finish -- see the note on seekInFlight in MainWindow.h.
+        if (m_videoSeekInFlight) {
+            if (m_sinceVideoSeek.elapsed() > kSeekSettleMs) m_videoSeekInFlight = false;
+        } else if (std::fabs(drift) > kHardResyncSec * rate) {
+            m_player->setSpeed(rate);
             m_player->seek(expectedSourceSec, /*exact=*/false);
+            m_sinceVideoSeek.restart();
+            m_videoSeekInFlight = true;
+        } else if (std::fabs(drift) > kDriftDeadZoneSec * rate) {
+            // Proportional, and capped. Video audio is disabled on this player
+            // (aid=no), so rate changes here are inaudible and the cap exists
+            // only to keep the correction from being visible as speed-up.
+            const double correction = std::clamp(-drift * kDriftGain, -kMaxVideoNudge, kMaxVideoNudge);
+            m_player->setSpeed(rate * (1.0 + correction));
+        } else {
+            m_player->setSpeed(rate); // inside the dead zone: stop correcting
         }
     }
 
@@ -1916,7 +1947,10 @@ void MainWindow::syncAudioTracksToTimeline(double timelineSeconds) {
 
         const Clip& clip = track.clips[clipIdx];
         const double expectedSourceSec = clip.sourceTimeAt(timelineSeconds);
-        audio.player->setSpeed(clip.effectiveSpeed()); // see syncVideoToTimeline
+        // NOT setSpeed(rate) here. The drift branch below sets the rate itself,
+        // including any correction, and setting it twice per tick means mpv
+        // receives a speed change on every one of them -- which on an audio
+        // player is audible as intermittent roughness.
         // Same fix as syncVideoToTimeline: only reload on an actual file
         // change, not merely a different clip index (which changes at
         // every cut even within one continuous source file).
@@ -1928,12 +1962,38 @@ void MainWindow::syncAudioTracksToTimeline(double timelineSeconds) {
             audio.pendingSeekSec = expectedSourceSec;
             audio.awaitingSeekAfterLoad = true;
             audio.player->loadFile(clip.sourcePath);
+            // A load positions the player asynchronously too, so drift readings
+            // are meaningless until it settles -- same guard, same reason.
+            audio.sinceSeek.restart();
+            audio.seekInFlight = true;
         } else {
-            // Same reasoning as syncVideoToTimeline, threshold scaled by rate
-            // for the same reason.
-            const double drift = std::fabs(audio.player->positionSec() - expectedSourceSec);
-            if (drift > 0.75 * clip.effectiveSpeed()) {
+            // Same scheme as syncVideoToTimeline, with a much smaller rate cap.
+            // This player IS audible, and mpv corrects pitch when changing
+            // tempo -- but a large enough tempo change is still perceptible as
+            // wobble. kMaxAudioNudge is well below the threshold where anyone
+            // can hear it, which makes correction slower here than for video
+            // and that is the right trade: inaudible and gradual beats
+            // audible and quick.
+            const double rate = clip.effectiveSpeed();
+            const double drift = audio.player->positionSec() - expectedSourceSec;
+
+            // Same in-flight guard as the video path, and this is the one that
+            // is actually audible: without it a single desync produced a burst
+            // of seeks, each restarting playback from its target, so the same
+            // fragment of audio was heard several times over.
+            if (audio.seekInFlight) {
+                if (audio.sinceSeek.elapsed() > kSeekSettleMs) audio.seekInFlight = false;
+            } else if (std::fabs(drift) > kAudioHardResyncSec * rate) {
+                audio.player->setSpeed(rate);
                 audio.player->seek(expectedSourceSec, /*exact=*/false);
+                audio.sinceSeek.restart();
+                audio.seekInFlight = true;
+            } else if (std::fabs(drift) > kDriftDeadZoneSec * rate) {
+                const double correction =
+                    std::clamp(-drift * kDriftGain, -kMaxAudioNudge, kMaxAudioNudge);
+                audio.player->setSpeed(rate * (1.0 + correction));
+            } else {
+                audio.player->setSpeed(rate);
             }
         }
 
