@@ -332,6 +332,19 @@ struct Marker {
     bool isPin() const { return (endSec - startSec) < 0.0005; }
 };
 
+// A stretch of the timeline where nothing on screen moves — found by
+// MotionAnalyzer, drawn by Timeline, removed by Project::rippleDeleteRange.
+//
+// View state, not project data: it's never saved, and any edit invalidates it
+// (the positions it describes may no longer hold the same footage). Re-running
+// the analysis after an edit is cheap because per-file motion is cached — only
+// the mapping through the current clips is redone.
+struct DowntimeRegion {
+    double startSec = 0.0;
+    double endSec   = 0.0;
+    double lengthSec() const { return endSec - startSec; }
+};
+
 // One row of the transcript panel: a segment as it appears at one place on the
 // TIMELINE.
 //
@@ -379,6 +392,16 @@ public:
     // (AudioPlayer instances, active overlay tracking, current
     // selection/playback state), since Project has no knowledge of those.
     void removeTrack(int trackIndex);
+
+    // Cuts [startSec, endSec) out of EVERY track and closes the gap — a ripple
+    // delete. Clips wholly inside are removed, clips straddling an edge are
+    // trimmed (or split in two, if they span the whole range), and everything
+    // after slides left by the range's length. Markers follow the same rule.
+    //
+    // All tracks, deliberately: cutting only the video would leave the paired
+    // audio (and any overlays timed against it) running late for the rest of
+    // the project.
+    void rippleDeleteRange(double startSec, double endSec);
 
     // Total project duration = end of the furthest clip across all tracks.
     double durationSec() const;

@@ -12,6 +12,7 @@
 #include "FFmpegExporter.h"
 #include "MediaProbe.h"
 #include "WaveformGenerator.h"
+#include "MotionAnalyzer.h"
 #include "ThumbnailGenerator.h"
 #include "OverlayImageLoader.h"
 #include "ProjectSerializer.h"
@@ -57,6 +58,14 @@
 #include <QPainter>
 #include <QSize>
 #include <QProgressDialog>
+#include <QDialog>
+#include <QFormLayout>
+#include <QDoubleSpinBox>
+#include <QCheckBox>
+#include <QDialogButtonBox>
+#include <QPointer>
+#include <atomic>
+#include <memory>
 #include <QDir>
 #include <QElapsedTimer>
 #include <algorithm>
@@ -259,6 +268,31 @@ void MainWindow::buildUi() {
     stripLayout->addWidget(redoButton);
     stripLayout->addWidget(splitButton);
     stripLayout->addWidget(pinButton);
+
+    // Downtime: find still sections, then clear them all at once. Each band on
+    // the timeline also carries its own remove button for picking one by one.
+    m_findDowntimeAction = new QAction(Theme::icon(Theme::Icon::Search, Theme::danger().lighter(120)),
+                                       "Find Downtime", this);
+    m_findDowntimeAction->setToolTip("Analyze the video for sections where nothing moves  (Ctrl+Shift+D)");
+    m_findDowntimeAction->setShortcut(QKeySequence("Ctrl+Shift+D"));
+    m_findDowntimeAction->setShortcutContext(Qt::ApplicationShortcut);
+    connect(m_findDowntimeAction, &QAction::triggered, this, &MainWindow::onFindDowntimeClicked);
+    addAction(m_findDowntimeAction);
+
+    m_removeAllDowntimeAction = new QAction(Theme::icon(Theme::Icon::Trash, Theme::danger().lighter(120)),
+                                            "Remove All", this);
+    m_removeAllDowntimeAction->setToolTip("Cut every highlighted still section and close the gaps");
+    m_removeAllDowntimeAction->setEnabled(false);
+    connect(m_removeAllDowntimeAction, &QAction::triggered, this, &MainWindow::onRemoveAllDowntimeClicked);
+
+    for (QAction* action : {m_findDowntimeAction, m_removeAllDowntimeAction}) {
+        auto* button = new QToolButton();
+        button->setDefaultAction(action);
+        button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        button->setIconSize(QSize(17, 17));
+        button->setCursor(Qt::PointingHandCursor);
+        stripLayout->addWidget(button);
+    }
 
     auto stripSeparator = []() {
         auto* line = new QFrame();
@@ -605,6 +639,7 @@ void MainWindow::buildUi() {
         hbar->setValue(hbar->value() + deltaPixels); // scrollbar clamps to valid range automatically
     });
     connect(m_timeline, &Timeline::clipDeleted, this, &MainWindow::onClipDeleted);
+    connect(m_timeline, &Timeline::downtimeRemoveRequested, this, &MainWindow::onDowntimeRemoveRequested);
     connect(m_timeline, &Timeline::clipsMovedBetweenTracks, this, &MainWindow::onClipsMovedBetweenTracks);
     // The single place edits made INSIDE the timeline (drags, trims, splits,
     // deletes, pins) become "unsaved changes". MainWindow's own mutations —
@@ -743,6 +778,9 @@ void MainWindow::buildMenus() {
     auto* editMenu = menuBar()->addMenu("&Edit");
     editMenu->addAction(m_undoAction);
     editMenu->addAction(m_redoAction);
+    editMenu->addSeparator();
+    editMenu->addAction(m_findDowntimeAction);
+    editMenu->addAction(m_removeAllDowntimeAction);
 
     auto* viewMenu = menuBar()->addMenu("&View");
     viewMenu->addAction(m_playerDock->toggleViewAction());
@@ -2691,6 +2729,7 @@ void MainWindow::onNewProject() {
 }
 
 void MainWindow::adoptLoadedProject(double playheadSec, double pixelsPerSecond) {
+    setDowntimeRegions({});
     // Every AudioPlayer is torn down and rebuilt rather than reused. They're
     // bound to a track INDEX, and the new project's track list has no
     // relationship to the old one's — a reused player would drive the wrong
@@ -2819,12 +2858,17 @@ void MainWindow::recordUndoState(const QString& label) {
     // signals an edit does. Recording it would push the restored state on as a
     // new entry, which discards the redo branch and makes undo un-redoable.
     if (m_restoringUndoState) return;
+    // Any edit may have moved footage out from under the highlighted regions.
+    // The downtime removal path records first and then re-installs the
+    // survivors, which it can shift exactly.
+    setDowntimeRegions({});
     m_undoStack.record(m_project, label);
     updateUndoActions();
 }
 
 void MainWindow::restoreProjectState(const Project& state) {
     m_restoringUndoState = true;
+    setDowntimeRegions({}); // positions belong to the state being left
 
     // Whether the audio machinery has to be rebuilt. Each AudioPlayer owns an
     // mpv instance, so tearing them down and recreating them costs enough to
@@ -2888,4 +2932,220 @@ void MainWindow::updateUndoActions() {
         const QString what = m_undoStack.redoLabel();
         m_redoAction->setText(what.isEmpty() ? "Redo" : QString("Redo %1").arg(what));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Downtime detection
+// ---------------------------------------------------------------------------
+
+void MainWindow::setDowntimeRegions(const QVector<DowntimeRegion>& regions) {
+    m_downtimeRegions = regions;
+    if (m_timeline) m_timeline->setDowntimeRegions(regions);
+    if (m_removeAllDowntimeAction) {
+        m_removeAllDowntimeAction->setEnabled(!regions.isEmpty());
+        m_removeAllDowntimeAction->setText(regions.isEmpty()
+            ? QString("Remove All") : QString("Remove All (%1)").arg(regions.size()));
+    }
+}
+
+void MainWindow::onFindDowntimeClicked() {
+    if (m_downtimeAnalysisRunning) return;
+
+    // Every distinct file that actually shows on screen. Disabled tracks are
+    // skipped for the same reason playback skips them: they aren't in the cut.
+    QStringList paths;
+    for (const Track& track : m_project.tracks) {
+        if (track.type != TrackType::Video || !track.enabled) continue;
+        for (const Clip& clip : track.clips) {
+            if (!paths.contains(clip.sourcePath)) paths.push_back(clip.sourcePath);
+        }
+    }
+    if (paths.isEmpty()) {
+        QMessageBox::information(this, "Find Downtime", "There's no video on the timeline to analyze.");
+        return;
+    }
+
+    // --- Settings ---------------------------------------------------------
+    QSettings settings;
+    DowntimeSettings opts;
+    opts.stillThresholdPct = settings.value("downtime/thresholdPct", opts.stillThresholdPct).toDouble();
+    opts.minDurationSec = settings.value("downtime/minSec", opts.minDurationSec).toDouble();
+    opts.paddingSec = settings.value("downtime/paddingSec", opts.paddingSec).toDouble();
+    opts.requireSilence = settings.value("downtime/requireSilence", opts.requireSilence).toBool();
+
+    QDialog dialog(this);
+    dialog.setWindowTitle("Find Downtime");
+    auto* form = new QFormLayout(&dialog);
+
+    auto* threshold = new QDoubleSpinBox();
+    threshold->setRange(0.05, 20.0);
+    threshold->setSingleStep(0.1);
+    threshold->setDecimals(2);
+    threshold->setSuffix(" % of frame");
+    threshold->setValue(opts.stillThresholdPct);
+    threshold->setToolTip("Changes smaller than this still count as \"no movement\".\n"
+                          "Raise it if a moving cursor or camera noise stops sections being found;\n"
+                          "lower it if sections with small but real motion are being flagged.");
+    form->addRow("Ignore changes under", threshold);
+
+    auto* minLength = new QDoubleSpinBox();
+    minLength->setRange(0.5, 600.0);
+    minLength->setSingleStep(0.5);
+    minLength->setSuffix(" s");
+    minLength->setValue(opts.minDurationSec);
+    form->addRow("Only sections longer than", minLength);
+
+    auto* padding = new QDoubleSpinBox();
+    padding->setRange(0.0, 3.0);
+    padding->setSingleStep(0.05);
+    padding->setSuffix(" s");
+    padding->setValue(opts.paddingSec);
+    padding->setToolTip("Footage kept at each edge so cuts don't land exactly on the motion.");
+    form->addRow("Keep at each edge", padding);
+
+    auto* silence = new QCheckBox("Only when the audio is quiet too");
+    silence->setChecked(opts.requireSilence);
+    silence->setToolTip("Leave still frames alone while someone is talking over them\n"
+                        "(slides, tutorials, voice-over).");
+    form->addRow(QString(), silence);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText("Analyze");
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    form->addRow(buttons);
+
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    opts.stillThresholdPct = threshold->value();
+    opts.minDurationSec = minLength->value();
+    opts.paddingSec = padding->value();
+    opts.requireSilence = silence->isChecked();
+    settings.setValue("downtime/thresholdPct", opts.stillThresholdPct);
+    settings.setValue("downtime/minSec", opts.minDurationSec);
+    settings.setValue("downtime/paddingSec", opts.paddingSec);
+    settings.setValue("downtime/requireSilence", opts.requireSilence);
+
+    // --- Analysis ---------------------------------------------------------
+    // Decoding runs on a worker; the dialog only appears if something actually
+    // needs decoding, so re-running with different settings (all cached) is
+    // instant and flicker-free.
+    const bool needsDecode = std::any_of(paths.cbegin(), paths.cend(),
+        [](const QString& p) { return !MotionAnalyzer::isCached(p); });
+
+    auto cancel = std::make_shared<std::atomic_bool>(false);
+    QPointer<QProgressDialog> progressDialog;
+    if (needsDecode) {
+        progressDialog = new QProgressDialog("Analyzing motion\u2026", "Cancel", 0, 1000, this);
+        progressDialog->setWindowTitle("Find Downtime");
+        progressDialog->setWindowModality(Qt::WindowModal);
+        progressDialog->setMinimumDuration(0);
+        progressDialog->setAutoClose(false);
+        progressDialog->setAutoReset(false);
+        progressDialog->setValue(0);
+        connect(progressDialog, &QProgressDialog::canceled, this, [cancel] { cancel->store(true); });
+    }
+
+    m_downtimeAnalysisRunning = true;
+    m_findDowntimeAction->setEnabled(false);
+
+    const int fileCount = paths.size();
+    auto* watcher = new QFutureWatcher<QHash<QString, MotionProfile>>(this);
+
+    connect(watcher, &QFutureWatcher<QHash<QString, MotionProfile>>::finished, this,
+            [this, watcher, progressDialog, cancel, opts] {
+        const QHash<QString, MotionProfile> profiles = watcher->result();
+        watcher->deleteLater();
+        if (progressDialog) progressDialog->deleteLater();
+        m_downtimeAnalysisRunning = false;
+        m_findDowntimeAction->setEnabled(true);
+
+        if (cancel->load()) {
+            statusBar()->showMessage("Downtime analysis cancelled", 3000);
+            return;
+        }
+
+        const QVector<DowntimeRegion> regions = MotionAnalyzer::findDowntime(m_project, profiles, opts);
+        setDowntimeRegions(regions);
+
+        if (regions.isEmpty()) {
+            statusBar()->showMessage("No downtime found with these settings", 5000);
+            return;
+        }
+        double total = 0.0;
+        for (const auto& r : regions) total += r.lengthSec();
+        statusBar()->showMessage(QString("Found %1 still section%2 \u2014 %3 s in total")
+                                     .arg(regions.size())
+                                     .arg(regions.size() == 1 ? "" : "s")
+                                     .arg(total, 0, 'f', 1), 8000);
+    });
+
+    watcher->setFuture(QtConcurrent::run([paths, cancel, progressDialog, fileCount, this] {
+        QHash<QString, MotionProfile> profiles;
+        for (int i = 0; i < fileCount; ++i) {
+            if (cancel->load()) break;
+            const QString& path = paths[i];
+            const QString name = QFileInfo(path).fileName();
+            auto report = [this, progressDialog, i, fileCount, name](double frac) {
+                const int value = static_cast<int>(((i + frac) / fileCount) * 1000.0);
+                QMetaObject::invokeMethod(this, [progressDialog, value, name, i, fileCount] {
+                    if (!progressDialog) return;
+                    progressDialog->setLabelText(fileCount > 1
+                        ? QString("Analyzing motion in %1  (%2 of %3)\u2026").arg(name).arg(i + 1).arg(fileCount)
+                        : QString("Analyzing motion in %1\u2026").arg(name));
+                    progressDialog->setValue(value);
+                }, Qt::QueuedConnection);
+            };
+            profiles.insert(path, MotionAnalyzer::analyze(path, cancel.get(), report));
+        }
+        return profiles;
+    }));
+}
+
+void MainWindow::onDowntimeRemoveRequested(int regionIndex) {
+    if (regionIndex < 0 || regionIndex >= m_downtimeRegions.size()) return;
+    removeDowntimeRegions({regionIndex}, "Remove Downtime");
+}
+
+void MainWindow::onRemoveAllDowntimeClicked() {
+    if (m_downtimeRegions.isEmpty()) return;
+    QVector<int> all;
+    for (int i = 0; i < m_downtimeRegions.size(); ++i) all.push_back(i);
+    removeDowntimeRegions(all, "Remove All Downtime");
+}
+
+void MainWindow::removeDowntimeRegions(QVector<int> indices, const QString& undoLabel) {
+    // Latest first. Cutting a later range never moves an earlier one, so each
+    // region's stored position is still exact when its turn comes — cutting
+    // earliest-first would mean re-deriving every later position after each cut.
+    std::sort(indices.begin(), indices.end(), std::greater<int>());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+
+    QVector<DowntimeRegion> survivors = m_downtimeRegions;
+    double playhead = m_currentTimelineSec;
+
+    for (int index : indices) {
+        if (index < 0 || index >= survivors.size()) continue;
+        const DowntimeRegion cut = survivors[index];
+        m_project.rippleDeleteRange(cut.startSec, cut.endSec);
+
+        survivors.removeAt(index);
+        for (DowntimeRegion& r : survivors) {
+            if (r.startSec >= cut.endSec) {
+                r.startSec -= cut.lengthSec();
+                r.endSec -= cut.lengthSec();
+            }
+        }
+        // The playhead follows the edit the same way the footage does, so it
+        // stays on the frame it was on rather than jumping ahead.
+        if (playhead >= cut.endSec) playhead -= cut.lengthSec();
+        else if (playhead > cut.startSec) playhead = cut.startSec;
+    }
+
+    m_timeline->clearSelection(); // selection keys index clip vectors that just changed
+    refreshTrackViews();
+    refreshTranscriptTimestamps();
+    recordUndoState(undoLabel);   // clears the regions...
+    setDowntimeRegions(survivors); // ...so the shifted survivors go back after
+    seekTimeline(std::clamp(playhead, 0.0, std::max(0.0, m_project.durationSec())));
 }

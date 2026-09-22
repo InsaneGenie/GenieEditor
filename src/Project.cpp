@@ -32,6 +32,87 @@ bool Project::splitClipAt(int trackIndex, int clipIndex, double timelinePosSec) 
     return true;
 }
 
+void Project::rippleDeleteRange(double startSec, double endSec) {
+    const double gap = endSec - startSec;
+    if (gap <= 0.0) return;
+
+    // Positions come out of floating-point division, so a clip that ends
+    // "exactly" at the cut can land a hair either side of it. Without a
+    // tolerance that produces zero-length slivers that are invisible on the
+    // timeline but still get handed to mpv and ffmpeg.
+    constexpr double kEps = 1e-4;
+    constexpr double kMinPieceSec = 0.01;
+
+    for (Track& track : tracks) {
+        QVector<Clip> kept;
+        kept.reserve(track.clips.size() + 1);
+
+        for (const Clip& clip : track.clips) {
+            const double clipStart = clip.trackPosSec;
+            const double clipEnd = clipStart + clip.durationSec();
+
+            if (clipEnd <= startSec + kEps) { // wholly before the cut
+                kept.push_back(clip);
+                continue;
+            }
+            if (clipStart >= endSec - kEps) { // wholly after: slide left
+                Clip moved = clip;
+                moved.trackPosSec -= gap;
+                kept.push_back(moved);
+                continue;
+            }
+
+            // Overlaps the cut. Each surviving side is converted through the
+            // clip's own time mapping, so a sped-up clip is trimmed at the
+            // right SOURCE moment rather than the timeline difference.
+            if (clipStart < startSec - kEps && startSec - clipStart >= kMinPieceSec) {
+                Clip left = clip;
+                left.sourceOutSec = clip.sourceTimeAt(startSec);
+                kept.push_back(left);
+            }
+            if (clipEnd > endSec + kEps && clipEnd - endSec >= kMinPieceSec) {
+                Clip right = clip;
+                right.sourceInSec = clip.sourceTimeAt(endSec);
+                right.trackPosSec = startSec;
+
+                // Overlay keyframes are relative to the clip's own start, which
+                // just moved later into the footage by this much. Shifting them
+                // keeps each key on the moment it was set against, instead of
+                // the whole animation sliding with the new start.
+                const double localShift = endSec - clipStart;
+                for (AnimatedProperty* prop : {&right.anim.x, &right.anim.y, &right.anim.scale,
+                                               &right.anim.opacity, &right.anim.rotation}) {
+                    for (Keyframe& k : prop->keys) k.timeSec -= localShift;
+                }
+                kept.push_back(right);
+            }
+        }
+        track.clips = kept;
+    }
+
+    // A point inside the removed range collapses onto the cut. Pins that were
+    // inside are dropped rather than stacked on the seam, since the moment
+    // they marked no longer exists.
+    auto mapTime = [&](double t) {
+        if (t <= startSec) return t;
+        if (t >= endSec) return t - gap;
+        return startSec;
+    };
+    QVector<Marker> keptMarkers;
+    for (const Marker& m : markers) {
+        const bool wasPin = m.isPin();
+        const bool startInside = m.startSec > startSec + kEps && m.startSec < endSec - kEps;
+        if (wasPin && startInside) continue;
+
+        Marker mapped = m;
+        mapped.startSec = mapTime(m.startSec);
+        mapped.endSec = mapTime(m.endSec);
+        if (!wasPin && mapped.isPin()) continue; // a region wholly inside the cut
+        keptMarkers.push_back(mapped);
+    }
+    markers = keptMarkers;
+}
+
 double Project::durationSec() const {
     double maxEnd = 0.0;
     for (const auto& track : tracks) {

@@ -812,6 +812,56 @@ void Timeline::paintEvent(QPaintEvent* event) {
     }
 
     // -------------------------------------------------------------------
+    // Downtime bands
+    // -------------------------------------------------------------------
+    // Over the clips, under every interaction overlay, so the playhead and snap
+    // guides still read clearly on top. Hatched rather than a flat wash: a flat
+    // tint over a clip looks like a colour change to the clip, whereas hatching
+    // unmistakably reads as "marked for something".
+    if (!m_downtimeRegions.isEmpty()) {
+        const QColor bandColor = Theme::danger();
+        QColor wash = bandColor;
+        wash.setAlpha(34);
+        QColor hatch = bandColor;
+        hatch.setAlpha(70);
+        QColor edge = bandColor;
+        edge.setAlpha(170);
+
+        for (int i = 0; i < m_downtimeRegions.size(); ++i) {
+            const DowntimeRegion& region = m_downtimeRegions[i];
+            const int x0 = secToX(region.startSec);
+            const int x1 = std::max(x0 + 1, secToX(region.endSec));
+            if (x1 < 0 || x0 > width()) continue;
+            const QRect band(x0, rulerBottom, x1 - x0, contentBottom - rulerBottom);
+
+            p.fillRect(band, wash);
+            p.fillRect(band, QBrush(hatch, Qt::BDiagPattern));
+            p.setPen(QPen(edge, 1, Qt::DashLine));
+            p.drawLine(x0, rulerBottom, x0, contentBottom);
+            p.drawLine(x1, rulerBottom, x1, contentBottom);
+            // The same band echoed in the ruler's marker strip, so the regions
+            // stay visible even with every lane scrolled out of view.
+            p.fillRect(QRect(x0, rulerBottom - kMarkerBandHeight, x1 - x0, kMarkerBandHeight), edge);
+
+            const QRect button = downtimeButtonRect(i);
+            if (button.isEmpty()) continue;
+            const bool hovered = (i == m_hoverDowntimeButton);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 0, 0, 110));
+            p.drawRoundedRect(QRectF(button).translated(0, 1), button.height() / 2.0, button.height() / 2.0);
+            p.setBrush(hovered ? bandColor.lighter(115) : bandColor);
+            p.drawRoundedRect(QRectF(button), button.height() / 2.0, button.height() / 2.0);
+
+            p.setFont(Theme::uiFont(-2, QFont::DemiBold));
+            p.setPen(Qt::white);
+            const QString label = button.width() > 30
+                ? QString("\u2715 Cut %1s").arg(region.lengthSec(), 0, 'f', 1)
+                : QString("\u2715");
+            p.drawText(button, Qt::AlignCenter, label);
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Interaction overlays
     // -------------------------------------------------------------------
     // Magnetic-snap guide, shown while actively dragging (internal clip drag OR
@@ -966,6 +1016,35 @@ void Timeline::paintEvent(QPaintEvent* event) {
     // part of the playhead rather than a label that happens to be nearby.
     p.setPen(QPen(playColor, 1.4));
     p.drawLine(playX, capsule.bottom(), playX, rulerBottom);
+}
+
+void Timeline::setDowntimeRegions(const QVector<DowntimeRegion>& regions) {
+    m_downtimeRegions = regions;
+    m_hoverDowntimeButton = -1;
+    update();
+}
+
+QRect Timeline::downtimeButtonRect(int regionIndex) const {
+    if (regionIndex < 0 || regionIndex >= m_downtimeRegions.size()) return {};
+    const DowntimeRegion& r = m_downtimeRegions[regionIndex];
+    const int x0 = secToX(r.startSec);
+    const int w = secToX(r.endSec) - x0;
+    constexpr int kH = 20;
+    constexpr int kFullW = 86;  // "✕ Cut 12.3s"
+    constexpr int kIconW = 22;  // just the ✕
+    // Sits just under the floating ruler, so it stays reachable however far
+    // the lanes are scrolled.
+    const int y = rulerBottomY() + 4;
+    if (w >= kFullW + 8) return QRect(x0 + (w - kFullW) / 2, y, kFullW, kH);
+    if (w >= kIconW + 4) return QRect(x0 + (w - kIconW) / 2, y, kIconW, kH);
+    return {};
+}
+
+int Timeline::downtimeButtonAt(const QPoint& pos) const {
+    for (int i = 0; i < m_downtimeRegions.size(); ++i) {
+        if (downtimeButtonRect(i).adjusted(-2, -2, 2, 2).contains(pos)) return i;
+    }
+    return -1;
 }
 
 QRect Timeline::pinHandleRect(double sec) const {
@@ -1184,6 +1263,15 @@ void Timeline::moveDraggedClipsToLane(int laneOffset) {
 }
 
 void Timeline::updateCursorForPosition(const QPoint& pos) {
+    const int downtimeHover = downtimeButtonAt(pos);
+    if (downtimeHover != m_hoverDowntimeButton) {
+        m_hoverDowntimeButton = downtimeHover;
+        update();
+    }
+    if (downtimeHover >= 0) {
+        setCursor(Qt::PointingHandCursor);
+        return;
+    }
     if (!m_project || isRulerY(pos.y())) {
         // A pointing hand over a pin's flag is the only signal that it's a
         // grabbable object rather than part of the ruler graphics.
@@ -1219,6 +1307,14 @@ void Timeline::mousePressEvent(QMouseEvent* event) {
     setFocus(Qt::MouseFocusReason); // so Delete/Backspace works immediately after clicking a clip
     m_hoverPreviewTrackIndex = -1; // don't leave the scrub-preview popup lingering during a drag
     m_hoverPreviewClipIndex = -1;
+    if (event->button() == Qt::LeftButton) {
+        const int downtimeIndex = downtimeButtonAt(event->pos());
+        if (downtimeIndex >= 0) {
+            m_drag = DragState{};
+            emit downtimeRemoveRequested(downtimeIndex);
+            return;
+        }
+    }
     if (isRulerY(event->pos().y())) {
         // Clicking a pin seeks exactly to it rather than to wherever in the
         // pin's few pixels the click happened to land — the whole point of
@@ -1500,6 +1596,7 @@ void Timeline::mouseReleaseEvent(QMouseEvent* event) {
 
 void Timeline::leaveEvent(QEvent*) {
     m_hoverSec = -1.0;
+    m_hoverDowntimeButton = -1;
     m_hoverPreviewTrackIndex = -1;
     m_hoverPreviewClipIndex = -1;
     update();

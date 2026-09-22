@@ -69,6 +69,11 @@ private slots:
     void onUndo();
     void onRedo();
 
+    // --- Downtime (still-section) detection -------------------------------
+    void onFindDowntimeClicked();
+    void onRemoveAllDowntimeClicked();
+    void onDowntimeRemoveRequested(int regionIndex);
+
     // --- Project files ------------------------------------------------------
     void onNewProject();
     void onOpenProject();
@@ -398,6 +403,20 @@ private:
     // projectModified does not record the restored state as a fresh edit --
     // which would make undo push a new entry and redo unreachable.
     bool m_restoringUndoState = false;
+
+    // Still sections from the last analysis, in timeline order. Mirrored into
+    // the Timeline for display. Cleared by any recorded edit (see
+    // recordUndoState) since an edit can move footage under them — except the
+    // ripple deletes this feature makes itself, which shift the survivors
+    // exactly and keep them.
+    QVector<DowntimeRegion> m_downtimeRegions;
+    QAction* m_findDowntimeAction = nullptr;
+    QAction* m_removeAllDowntimeAction = nullptr;
+    bool m_downtimeAnalysisRunning = false;
+    void setDowntimeRegions(const QVector<DowntimeRegion>& regions);
+    // Ripple-deletes the given regions (indices into m_downtimeRegions) as ONE
+    // undo step, keeping the rest on screen at their shifted positions.
+    void removeDowntimeRegions(QVector<int> indices, const QString& undoLabel);
 
     QString m_currentProjectPath;
     bool m_projectDirty = false;

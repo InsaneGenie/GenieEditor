@@ -90,6 +90,13 @@ public:
     // tracks have shifted.
     void clearSelection();
 
+    // Still sections to highlight, each drawn as a hatched band across every
+    // lane with its own remove button. Replaces whatever was shown before; an
+    // empty vector clears them. The Timeline only DISPLAYS these — removing
+    // one is reported via downtimeRemoveRequested and performed by MainWindow,
+    // which owns the analysis and the undo history.
+    void setDowntimeRegions(const QVector<DowntimeRegion>& regions);
+
 signals:
     void seekRequested(double seconds);
     // Fired on every selection change with the most-recently-touched clip —
@@ -160,6 +167,10 @@ signals:
     // Emitted after this widget has already added or removed a pin in the
     // Project — same "act directly, then announce" pattern the clip edits use.
     void markersChanged();
+
+    // The remove button on a downtime band was clicked. Nothing has been
+    // changed yet — MainWindow performs the ripple delete.
+    void downtimeRemoveRequested(int regionIndex);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -238,6 +249,13 @@ private:
     bool isRulerY(int y) const { return y >= rulerTopY() && y < rulerBottomY(); }
     // Index into Project::markers of the pin whose flag is under `pos`, or -1.
     int pinIndexAt(const QPoint& pos) const;
+
+    // The remove button drawn on a downtime band, and which band's button is
+    // under `pos` (-1 for none). Empty rect when the band is too narrow on
+    // screen to carry one — at that zoom it can still be removed from the
+    // toolbar or by zooming in.
+    QRect downtimeButtonRect(int regionIndex) const;
+    int downtimeButtonAt(const QPoint& pos) const;
     double xToSec(int x) const;
     int secToX(double sec) const;
     DragMode dragModeAt(const QPoint& pos, int trackIndex, int clipIndex) const;
@@ -309,6 +327,9 @@ private:
     double m_pxPerSec = 60.0; // zoom level
     int m_scrollOffsetY = 0;  // see setVerticalScrollOffset
     QSet<qint64> m_selectedClipKeys;
+
+    QVector<DowntimeRegion> m_downtimeRegions;
+    int m_hoverDowntimeButton = -1;
 
     DragState m_drag;
     QVector<double> m_snapTargets;   // candidate seconds to snap to, gathered at drag start
