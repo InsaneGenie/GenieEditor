@@ -1083,12 +1083,20 @@ void MainWindow::setupAudioPlayerForTrack(int trackIndex) {
         for (auto& a : m_audioTracks) {
             if (a.trackIndex != trackIndex) continue;
             if (a.awaitingSeekAfterLoad) {
-                a.player->seek(a.pendingSeekSec);
+                // Never let mpv briefly play from the beginning of a newly
+                // loaded file before the requested clip in-point is applied.
+                // That short autoplay window sounds like a repeated syllable
+                // when moving between clips from different files.
+                a.player->pause();
+                a.player->seek(a.pendingSeekSec, /*exact=*/true);
                 a.awaitingSeekAfterLoad = false;
+                a.sinceSeek.restart();
+                a.seekInFlight = true;
             }
-            // mpv autoplays on load by default — respect current
-            // pause/play intent rather than always starting playback.
-            if (!m_isPlayingIntent) a.player->pause();
+            // loadfile may change mpv's pause state, so restore the editor's
+            // intent explicitly after positioning the new source.
+            if (m_isPlayingIntent) a.player->play();
+            else a.player->pause();
             break;
         }
     });
@@ -1722,14 +1730,19 @@ void MainWindow::onPlayerFileLoaded(double /*durationSeconds*/) {
     // syncVideoToTimeline() actually gets applied, once mpv confirms the
     // file is ready to seek within.
     if (m_awaitingSeekAfterLoad) {
-        m_player->seek(m_pendingSeekSec);
-        m_awaitingSeekAfterLoad = false;
-    }
-    // mpv autoplays on load by default — respect current pause/play intent
-    // rather than always starting playback on a freshly loaded file.
-    if (!m_isPlayingIntent) {
+        // Suppress the first frames of the file until its actual clip in-point
+        // has been requested. Otherwise loadfile's autoplay can expose frame 0
+        // briefly, which looks like the preview jumped backwards.
         m_player->pause();
+        m_player->seek(m_pendingSeekSec, /*exact=*/true);
+        m_awaitingSeekAfterLoad = false;
+        m_sinceVideoSeek.restart();
+        m_videoSeekInFlight = true;
     }
+    // loadfile may change mpv's pause state; restore the editor's state after
+    // the initial seek rather than relying on mpv's default autoplay behavior.
+    if (m_isPlayingIntent) m_player->play();
+    else m_player->pause();
 }
 
 void MainWindow::onUserToggledPlayback(bool nowPlaying) {
@@ -1865,7 +1878,15 @@ void MainWindow::syncVideoToTimeline(double timelineSeconds) {
         m_currentLoadedPath = clip.sourcePath;
         m_pendingSeekSec = expectedSourceSec;
         m_awaitingSeekAfterLoad = true;
+        // Keep frame/audio zero from escaping while the asynchronous load is
+        // waiting for FILE_LOADED and its pending in-point seek.
+        m_player->pause();
         m_player->loadFile(clip.sourcePath);
+    } else if (m_awaitingSeekAfterLoad) {
+        // Loading is asynchronous while the master timeline continues. Keep
+        // the pending target current so FILE_LOADED does not seek to the stale
+        // position captured when loading began.
+        m_pendingSeekSec = expectedSourceSec;
     } else {
         // Self-correcting drift check rather than seeking every tick — also
         // what transparently handles rewind/fast-forward and any other
@@ -1910,7 +1931,12 @@ void MainWindow::syncVideoToTimeline(double timelineSeconds) {
             if (m_sinceVideoSeek.elapsed() > kSeekSettleMs) m_videoSeekInFlight = false;
         } else if (std::fabs(drift) > kHardResyncSec * rate) {
             m_player->setSpeed(rate);
-            m_player->seek(expectedSourceSec, /*exact=*/false);
+            // This is intentionally exact. A keyframe seek can land seconds
+            // before the target; the next drift check then seeks to that same
+            // keyframe again, producing the repeated-frame loop this branch is
+            // supposed to recover from. Hard resyncs are rare enough that the
+            // extra decode work is the correct trade-off.
+            m_player->seek(expectedSourceSec, /*exact=*/true);
             m_sinceVideoSeek.restart();
             m_videoSeekInFlight = true;
         } else if (std::fabs(drift) > kDriftDeadZoneSec * rate) {
@@ -1924,8 +1950,15 @@ void MainWindow::syncVideoToTimeline(double timelineSeconds) {
         }
     }
 
-    if (m_isPlayingIntent && m_player->isPaused()) m_player->play();
-    if (!m_isPlayingIntent && !m_player->isPaused()) m_player->pause();
+    // While loading, stay paused until onPlayerFileLoaded has applied the clip
+    // in-point. This guard is necessary because the normal play-intent branch
+    // runs in the same tick that initiated the asynchronous load.
+    if (m_awaitingSeekAfterLoad) {
+        if (!m_player->isPaused()) m_player->pause();
+    } else {
+        if (m_isPlayingIntent && m_player->isPaused()) m_player->play();
+        if (!m_isPlayingIntent && !m_player->isPaused()) m_player->pause();
+    }
 }
 
 QImage MainWindow::renderOverlayBitmap(int trackIndex, int clipIndex, const Clip& clip,
@@ -2122,11 +2155,23 @@ void MainWindow::syncAudioTracksToTimeline(double timelineSeconds) {
             audio.currentLoadedPath = clip.sourcePath;
             audio.pendingSeekSec = expectedSourceSec;
             audio.awaitingSeekAfterLoad = true;
+            // Apply the clip rate before playback resumes. Without this, a new
+            // file inherits the preceding clip's speed until the seek-settle
+            // guard expires, which immediately creates A/V drift.
+            audio.player->setSpeed(clip.effectiveSpeed());
+            // Prevent mpv from outputting the start of the file while the
+            // FILE_LOADED callback is waiting to seek to this clip's in-point.
+            audio.player->pause();
             audio.player->loadFile(clip.sourcePath);
             // A load positions the player asynchronously too, so drift readings
             // are meaningless until it settles -- same guard, same reason.
             audio.sinceSeek.restart();
             audio.seekInFlight = true;
+        } else if (audio.awaitingSeekAfterLoad) {
+            // The timeline keeps advancing during asynchronous I/O. Refresh
+            // the target until FILE_LOADED fires so this player joins at the
+            // current position instead of starting behind the video.
+            audio.pendingSeekSec = expectedSourceSec;
         } else {
             // Same scheme as syncVideoToTimeline, with a much smaller rate cap.
             // This player IS audible, and mpv corrects pitch when changing
@@ -2146,7 +2191,11 @@ void MainWindow::syncAudioTracksToTimeline(double timelineSeconds) {
                 if (audio.sinceSeek.elapsed() > kSeekSettleMs) audio.seekInFlight = false;
             } else if (std::fabs(drift) > kAudioHardResyncSec * rate) {
                 audio.player->setSpeed(rate);
-                audio.player->seek(expectedSourceSec, /*exact=*/false);
+                // Audio packet/keyframe seeks commonly land before the target.
+                // Re-evaluating that result caused the same fragment to be
+                // replayed two or three times. Exact seeking makes a hard
+                // resync converge in one operation.
+                audio.player->seek(expectedSourceSec, /*exact=*/true);
                 audio.sinceSeek.restart();
                 audio.seekInFlight = true;
             } else if (std::fabs(drift) > kDriftDeadZoneSec * rate) {
@@ -2158,8 +2207,12 @@ void MainWindow::syncAudioTracksToTimeline(double timelineSeconds) {
             }
         }
 
-        if (m_isPlayingIntent && audio.player->isPaused()) audio.player->play();
-        if (!m_isPlayingIntent && !audio.player->isPaused()) audio.player->pause();
+        if (audio.awaitingSeekAfterLoad) {
+            if (!audio.player->isPaused()) audio.player->pause();
+        } else {
+            if (m_isPlayingIntent && audio.player->isPaused()) audio.player->play();
+            if (!m_isPlayingIntent && !audio.player->isPaused()) audio.player->pause();
+        }
     }
 }
 

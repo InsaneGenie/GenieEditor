@@ -58,54 +58,66 @@ endif()
 # ---------------------------------------------------------------------------
 # Sources
 # ---------------------------------------------------------------------------
+# Keep the source directory portable across Windows (case-insensitive) and
+# Linux/macOS (case-sensitive).  Existing projects normally use "src", while
+# the supplied source archive uses "Src".
+set(GENIE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(NOT EXISTS "${GENIE_SOURCE_DIR}")
+    set(GENIE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Src")
+endif()
+
 add_executable(GenieEditor
-    src/main.cpp
-    src/Theme.cpp
+    ${GENIE_SOURCE_DIR}/main.cpp
+    ${GENIE_SOURCE_DIR}/Theme.cpp
     include/Theme.h
-    src/MainWindow.cpp
+    ${GENIE_SOURCE_DIR}/MainWindow.cpp
     include/MainWindow.h
-    src/PlayerWidget.cpp
+    ${GENIE_SOURCE_DIR}/PlayerWidget.cpp
     include/PlayerWidget.h
-    src/Timeline.cpp
+    ${GENIE_SOURCE_DIR}/Timeline.cpp
     include/Timeline.h
-    src/Project.cpp
-    src/UndoStack.cpp
+    ${GENIE_SOURCE_DIR}/Project.cpp
+    ${GENIE_SOURCE_DIR}/UndoStack.cpp
     include/UndoStack.h
     include/Project.h
-    src/ProjectSerializer.cpp
+    ${GENIE_SOURCE_DIR}/ProjectSerializer.cpp
     include/ProjectSerializer.h
-    src/FFmpegExporter.cpp
+    ${GENIE_SOURCE_DIR}/FFmpegExporter.cpp
     include/FFmpegExporter.h
-    src/Transcriber.cpp
+    ${GENIE_SOURCE_DIR}/Transcriber.cpp
     include/Transcriber.h
-    src/MediaProbe.cpp
+    ${GENIE_SOURCE_DIR}/MediaProbe.cpp
     include/MediaProbe.h
-    src/WaveformGenerator.cpp
+    ${GENIE_SOURCE_DIR}/WaveformGenerator.cpp
     include/WaveformGenerator.h
-    src/TrackHeaderPanel.cpp
+    ${GENIE_SOURCE_DIR}/TrackHeaderPanel.cpp
     include/TrackHeaderPanel.h
     include/TimelineMetrics.h
-    src/ThumbnailGenerator.cpp
+    ${GENIE_SOURCE_DIR}/ThumbnailGenerator.cpp
     include/ThumbnailGenerator.h
-    src/AudioPlayer.cpp
+    ${GENIE_SOURCE_DIR}/AudioPlayer.cpp
     include/AudioPlayer.h
-    src/KlipyClient.cpp
+    ${GENIE_SOURCE_DIR}/KlipyClient.cpp
     include/KlipyClient.h
-    src/KlipyPanel.cpp
-    src/MyInstantsClient.cpp
-    include/MyInstantsClient.h
-    src/SoundEffectsPanel.cpp
-    include/SoundEffectsPanel.h
+    ${GENIE_SOURCE_DIR}/KlipyPanel.cpp
     include/KlipyPanel.h
-    src/OverlayStageWidget.cpp
+    ${GENIE_SOURCE_DIR}/TenorClient.cpp
+    include/TenorClient.h
+    ${GENIE_SOURCE_DIR}/TenorPanel.cpp
+    include/TenorPanel.h
+    ${GENIE_SOURCE_DIR}/MyInstantsClient.cpp
+    include/MyInstantsClient.h
+    ${GENIE_SOURCE_DIR}/SoundEffectsPanel.cpp
+    include/SoundEffectsPanel.h
+    ${GENIE_SOURCE_DIR}/OverlayStageWidget.cpp
     include/OverlayStageWidget.h
-    src/OverlayInspectorPanel.cpp
+    ${GENIE_SOURCE_DIR}/OverlayInspectorPanel.cpp
     include/OverlayInspectorPanel.h
-    src/MediaBrowserPanel.cpp
+    ${GENIE_SOURCE_DIR}/MediaBrowserPanel.cpp
     include/MediaBrowserPanel.h
-    src/MediaThumbnailProxyModel.cpp
+    ${GENIE_SOURCE_DIR}/MediaThumbnailProxyModel.cpp
     include/MediaThumbnailProxyModel.h
-    src/OverlayImageLoader.cpp
+    ${GENIE_SOURCE_DIR}/OverlayImageLoader.cpp
     include/OverlayImageLoader.h
 )
 

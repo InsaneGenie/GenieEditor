@@ -1373,7 +1373,14 @@ void Timeline::mouseMoveEvent(QMouseEvent* event) {
             primaryStartTrackPosSec = m_drag.movingClips[m_drag.primarySnapshotIndex].startTrackPosSec;
         }
 
-        const double duration = m_drag.startSourceOutSec - m_drag.startSourceInSec;
+        // Drag snapping is in timeline time, so account for playback speed.
+        double rate = 1.0;
+        if (m_drag.primaryTrackIndex >= 0 && m_drag.primaryTrackIndex < m_project->tracks.size()) {
+            const auto& primaryClips = m_project->tracks[m_drag.primaryTrackIndex].clips;
+            if (m_drag.primaryClipIndex >= 0 && m_drag.primaryClipIndex < primaryClips.size())
+                rate = std::max(Clip::kMinSpeed, primaryClips[m_drag.primaryClipIndex].effectiveSpeed());
+        }
+        const double duration = (m_drag.startSourceOutSec - m_drag.startSourceInSec) / rate;
         double newStart = std::max(0.0, primaryStartTrackPosSec + deltaSec);
         const double newEnd = newStart + duration;
 
@@ -1477,6 +1484,7 @@ void Timeline::mouseReleaseEvent(QMouseEvent* event) {
     const bool changedLane = m_drag.mode == DragMode::MoveClip && m_drag.laneOffset != 0;
 
     const bool wasEditing = m_drag.mode != DragMode::None;
+    const bool actuallyMoved = event->pos() != m_drag.startMousePos;
 
     m_drag = DragState{};
     m_activeSnapSec = -1.0;
@@ -1487,7 +1495,7 @@ void Timeline::mouseReleaseEvent(QMouseEvent* event) {
     // Announced on RELEASE rather than per mouse-move: a single drag would
     // otherwise fire this hundreds of times, and the answer it carries ("this
     // project has unsaved changes") is the same every time.
-    if (wasEditing) emit projectModified();
+    if (wasEditing && actuallyMoved) emit projectModified();
 }
 
 void Timeline::leaveEvent(QEvent*) {
@@ -1685,6 +1693,7 @@ void Timeline::deleteSelectedClips() {
     updateGeometry();
     update();
     emit clipDeleted();
+    emit projectModified();
 }
 
 void Timeline::keyPressEvent(QKeyEvent* event) {

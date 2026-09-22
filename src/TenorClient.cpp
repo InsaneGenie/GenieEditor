@@ -52,12 +52,14 @@ void TenorClient::search(const QString& query, int limit) {
     QNetworkRequest request(url);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::NoLessSafeRedirectPolicy);
-    m_searchReply = m_network->get(request);
+    QNetworkReply* reply = m_network->get(request);
+    m_searchReply = reply;
 
-    connect(m_searchReply, &QNetworkReply::finished, this, [this] {
-        QNetworkReply* reply = m_searchReply;
-        if (!reply) return;
-        m_searchReply = nullptr;
+    // Capture the reply that belongs to THIS request. An aborted older reply may
+    // emit finished() after a newer request has already replaced m_searchReply;
+    // reading the member from the callback can otherwise steal/cancel the new one.
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        if (m_searchReply == reply) m_searchReply = nullptr;
         reply->deleteLater();
 
         if (reply->error() == QNetworkReply::OperationCanceledError) return; // superseded, not a failure

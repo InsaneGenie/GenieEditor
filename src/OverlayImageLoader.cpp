@@ -138,34 +138,46 @@ OverlayFrames decode(const QString& path) {
     return out;
 }
 
-const CacheEntry* fetch(const QString& path) {
+OverlayFrames fetchFrames(const QString& path) {
     const QFileInfo info(path);
     const qint64 modifiedMs = info.lastModified().toMSecsSinceEpoch();
     const qint64 sizeBytes = info.size();
 
-    auto it = g_cache.find(path);
-    if (it != g_cache.end() && it->modifiedMs == modifiedMs && it->sizeBytes == sizeBytes) {
-        it->lastUsed = ++g_useCounter;
-        return &it.value();
+    {
+        QMutexLocker lock(&g_cacheMutex);
+        auto it = g_cache.find(path);
+        if (it != g_cache.end() && it->modifiedMs == modifiedMs && it->sizeBytes == sizeBytes) {
+            it->lastUsed = ++g_useCounter;
+            return it->frames; // QImage/QVector are implicitly shared
+        }
     }
 
-    // Keyed on modification time and size as well as path, so re-exporting a
-    // title from another program and switching back picks up the new version
-    // instead of showing a stale one until restart.
-    CacheEntry entry;
-    entry.frames = decode(path);
-    entry.modifiedMs = modifiedMs;
-    entry.sizeBytes = sizeBytes;
-    entry.lastUsed = ++g_useCounter;
-    for (const QImage& frame : entry.frames.frames) {
-        entry.memoryBytes += static_cast<qint64>(frame.sizeInBytes());
+    // Decoding a large animation can be expensive. Do it without holding the
+    // cache-wide mutex so unrelated overlays can still be served concurrently.
+    CacheEntry decoded;
+    decoded.frames = decode(path);
+    decoded.modifiedMs = modifiedMs;
+    decoded.sizeBytes = sizeBytes;
+    for (const QImage& frame : decoded.frames.frames) {
+        decoded.memoryBytes += static_cast<qint64>(frame.sizeInBytes());
     }
 
-    g_cache.insert(path, entry);
+    QMutexLocker lock(&g_cacheMutex);
+    // Another worker may have completed the same file while we decoded. Prefer
+    // that entry and avoid replacing a newer result unnecessarily.
+    auto existing = g_cache.find(path);
+    if (existing != g_cache.end()
+        && existing->modifiedMs == modifiedMs
+        && existing->sizeBytes == sizeBytes) {
+        existing->lastUsed = ++g_useCounter;
+        return existing->frames;
+    }
+
+    decoded.lastUsed = ++g_useCounter;
+    g_cache.insert(path, decoded);
     enforceCacheBudget();
-
     auto inserted = g_cache.constFind(path);
-    return inserted == g_cache.constEnd() ? nullptr : &inserted.value();
+    return inserted == g_cache.constEnd() ? OverlayFrames() : inserted->frames;
 }
 
 } // namespace
@@ -189,18 +201,13 @@ int OverlayFrames::indexAt(double localSec) const {
 }
 
 QImage OverlayImageLoader::load(const QString& path) {
-    QMutexLocker lock(&g_cacheMutex);
-    const CacheEntry* entry = fetch(path);
-    if (!entry || entry->frames.frames.isEmpty()) return QImage();
-    // QImage is implicitly shared, so handing back a cached copy costs a
-    // refcount bump rather than a memcpy.
-    return entry->frames.frames.first();
+    const OverlayFrames frames = fetchFrames(path);
+    if (frames.frames.isEmpty()) return QImage();
+    return frames.frames.first();
 }
 
 OverlayFrames OverlayImageLoader::loadFrames(const QString& path) {
-    QMutexLocker lock(&g_cacheMutex);
-    const CacheEntry* entry = fetch(path);
-    return entry ? entry->frames : OverlayFrames();
+    return fetchFrames(path);
 }
 
 bool OverlayImageLoader::isAnimated(const QString& path) {

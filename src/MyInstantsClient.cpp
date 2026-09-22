@@ -91,12 +91,14 @@ void MyInstantsClient::runListRequest(const QUrl& url) {
                          QNetworkRequest::NoLessSafeRedirectPolicy);
     // Some community deployments reject requests with no user agent outright.
     request.setHeader(QNetworkRequest::UserAgentHeader, "GenieEditor/1.0");
-    m_listReply = m_network->get(request);
+    QNetworkReply* reply = m_network->get(request);
+    m_listReply = reply;
 
-    connect(m_listReply, &QNetworkReply::finished, this, [this] {
-        QNetworkReply* reply = m_listReply;
-        if (!reply) return;
-        m_listReply = nullptr;
+    // Keep the callback tied to the request that created it. An aborted old
+    // request can finish after a newer one starts, so consulting m_listReply
+    // here would risk processing the newer reply from the older callback.
+    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+        if (m_listReply == reply) m_listReply = nullptr;
         reply->deleteLater();
 
         if (reply->error() == QNetworkReply::OperationCanceledError) return; // superseded, not a failure
@@ -127,17 +129,21 @@ QVector<InstantSound> MyInstantsClient::parseListResponse(const QByteArray& json
 
     QJsonParseError error;
     const QJsonDocument doc = QJsonDocument::fromJson(json, &error);
-    if (error.error != QJsonParseError::NoError || !doc.isObject()) return results;
+    if (error.error != QJsonParseError::NoError) return results;
 
-    // The documented envelope is {status, author, data:[...]}, but a bare array
-    // is accepted too — this is a scraper, and forks of it differ. Being liberal
-    // about the wrapper costs three lines and avoids the panel appearing broken
-    // against a slightly different deployment.
+    // The documented envelope is {status, author, data:[...]}, but community
+    // deployments also return a bare array. Support both as the comment promises.
     QJsonArray items;
-    const QJsonObject root = doc.object();
-    if (root["data"].isArray()) items = root["data"].toArray();
-    else if (root["results"].isArray()) items = root["results"].toArray();
-    else return results;
+    if (doc.isArray()) {
+        items = doc.array();
+    } else if (doc.isObject()) {
+        const QJsonObject root = doc.object();
+        if (root["data"].isArray()) items = root["data"].toArray();
+        else if (root["results"].isArray()) items = root["results"].toArray();
+        else return results;
+    } else {
+        return results;
+    }
 
     for (const QJsonValue& value : items) {
         if (!value.isObject()) continue;

@@ -429,11 +429,19 @@ QString FFmpegExporter::buildFilterGraph(const Project& project, const Options& 
             // the already-stretched stream.
             const QString tempo = atempoChain(clip.effectiveSpeed());
 
+            // volumePercent is a linear preview multiplier. Convert it to dB
+            // here so exported loudness matches the editor's per-track preview.
+            const double linearTrackVolume = std::max(0.0, track.volumePercent / 100.0);
+            const double percentDb = linearTrackVolume > 0.0
+                ? 20.0 * std::log10(linearTrackVolume)
+                : -120.0; // effectively silent without relying on -inf parsing
+            const double exportGainDb = clip.gainDb + track.gainDb + percentDb;
+
             chains << QString("[%1:a]atrim=start=%2:end=%3,asetpts=PTS-STARTPTS,%7"
                               "aresample=48000,volume=%4dB,adelay=%5:all=1[%6]")
                           .arg(inputIndex)
                           .arg(num(clip.sourceInSec, 3)).arg(num(clip.sourceOutSec, 3))
-                          .arg(num(clip.gainDb + track.gainDb, 2))
+                          .arg(num(exportGainDb, 2))
                           .arg(delayMs)
                           .arg(label)
                           .arg(tempo.isEmpty() ? QString() : tempo + ",");

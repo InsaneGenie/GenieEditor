@@ -84,6 +84,18 @@ std::vector<float> decodeAudioToPcm16kMono(const QString& path) {
         av_packet_unref(packet);
     }
 
+    // Drain delayed decoder frames first; then flush samples buffered by swr.
+    if (avcodec_send_packet(codecCtx, nullptr) == 0) {
+        while (avcodec_receive_frame(codecCtx, frame) == 0) {
+            const int outSamples = swr_get_out_samples(swr, frame->nb_samples);
+            if (outSamples > static_cast<int>(convBuf.size())) convBuf.resize(outSamples);
+            uint8_t* outPtrs[1] = { reinterpret_cast<uint8_t*>(convBuf.data()) };
+            const int converted = swr_convert(swr, outPtrs, outSamples,
+                const_cast<const uint8_t**>(frame->data), frame->nb_samples);
+            if (converted > 0) samples.insert(samples.end(), convBuf.begin(), convBuf.begin() + converted);
+        }
+    }
+
     // Flush any samples still buffered inside the resampler.
     int flushed;
     do {
@@ -179,11 +191,11 @@ QVector<TranscriptSegment> Transcriber::transcribe(const QString& mediaPath) {
     // guess doesn't poison everything after it.
     params.no_context = true;
 
-    // whisper.cpp's own default thread count is fairly conservative —
-    // explicitly use every logical core available rather than leaving
-    // real speedup on the table on a multi-core machine.
+    // Leave a little headroom for playback/UI/background decoding instead of
+    // saturating every logical core and making the editor feel frozen.
     const unsigned hwThreads = std::thread::hardware_concurrency();
-    params.n_threads = hwThreads > 0 ? static_cast<int>(hwThreads) : 4;
+    params.n_threads = hwThreads > 2 ? static_cast<int>(hwThreads - 2)
+                                     : (hwThreads > 0 ? static_cast<int>(hwThreads) : 4);
 
     params.progress_callback = &Transcriber::progressTrampoline;
     params.progress_callback_user_data = this;

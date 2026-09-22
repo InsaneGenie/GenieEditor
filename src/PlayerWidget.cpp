@@ -336,7 +336,6 @@ void PlayerWidget::clearOverlay(int id) {
 
 void PlayerWidget::timerEvent(QTimerEvent*) {
     handleMpvEvents();
-    emit positionChanged(positionSec());
 }
 
 void PlayerWidget::handleMpvEvents() {

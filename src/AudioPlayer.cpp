@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include <QByteArray>
+#include <QVariant>
 #include <vector>
 #include <stdexcept>
 
@@ -76,8 +77,15 @@ bool AudioPlayer::isPaused() const {
 }
 
 void AudioPlayer::setMuted(bool muted) {
+    // MainWindow calls this from its sync loop. Avoid sending an identical mpv
+    // property command up to 60 times per second for every audio track.
+    constexpr const char* kCachedMuteProperty = "_genie_cached_mute";
+    const QVariant cached = property(kCachedMuteProperty);
+    if (cached.isValid() && cached.toBool() == muted) return;
+
     const int flag = muted ? 1 : 0;
     mpv_set_property(m_mpv, "mute", MPV_FORMAT_FLAG, const_cast<int*>(&flag));
+    setProperty(kCachedMuteProperty, muted);
 }
 
 void AudioPlayer::setSpeed(double speed) {
@@ -89,8 +97,16 @@ void AudioPlayer::setSpeed(double speed) {
 }
 
 void AudioPlayer::setVolume(int percent) {
+    // Volume is also checked every sync tick. Caching here keeps the public API
+    // unchanged while eliminating a continuous stream of redundant commands
+    // to each mpv audio instance.
+    constexpr const char* kCachedVolumeProperty = "_genie_cached_volume";
+    const QVariant cached = property(kCachedVolumeProperty);
+    if (cached.isValid() && cached.toInt() == percent) return;
+
     double vol = percent;
     mpv_set_property(m_mpv, "volume", MPV_FORMAT_DOUBLE, &vol);
+    setProperty(kCachedVolumeProperty, percent);
 }
 
 double AudioPlayer::positionSec() const {
@@ -101,7 +117,6 @@ double AudioPlayer::positionSec() const {
 
 void AudioPlayer::timerEvent(QTimerEvent*) {
     handleMpvEvents();
-    emit positionChanged(positionSec());
 }
 
 void AudioPlayer::handleMpvEvents() {

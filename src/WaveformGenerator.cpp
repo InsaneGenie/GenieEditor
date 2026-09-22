@@ -223,10 +223,39 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
         }
         av_packet_unref(packet);
     }
+    // Drain delayed decoder frames before finalizing the waveform. Some codecs
+    // buffer frames internally, and without this their tail never reaches swr.
+    if (avcodec_send_packet(codecCtx, nullptr) == 0) {
+        while (avcodec_receive_frame(codecCtx, frame) == 0) {
+            const int outSamples = swr_get_out_samples(swr, frame->nb_samples);
+            if (outSamples > static_cast<int>(monoBuf.size())) monoBuf.resize(outSamples);
+            uint8_t* outPtrs[1] = { reinterpret_cast<uint8_t*>(monoBuf.data()) };
+            const int converted = swr_convert(swr, outPtrs, outSamples,
+                const_cast<const uint8_t**>(frame->data), frame->nb_samples);
+            for (int i = 0; i < converted; ++i) {
+                const double sample = monoBuf[i];
+                bucketMax = std::max(bucketMax, std::fabs(sample));
+                bucketEnergy += sample * sample;
+                ++bucketSamples;
+                sampleCounter += 1.0;
+                if (sampleCounter >= samplesPerBucket) {
+                    result.peaks.push_back(static_cast<float>(bucketMax));
+                    result.rms.push_back(static_cast<float>(std::sqrt(bucketEnergy / bucketSamples)));
+                    bucketMax = 0.0; bucketEnergy = 0.0; bucketSamples = 0;
+                    sampleCounter -= samplesPerBucket;
+                }
+            }
+        }
+    }
+
     if (bucketSamples > 0) {
         result.peaks.push_back(static_cast<float>(bucketMax));
         result.rms.push_back(static_cast<float>(std::sqrt(bucketEnergy / bucketSamples)));
     }
+
+    // Store duration in the cached object too. Previously it was assigned only
+    // after cache insertion, so cache hits incorrectly reported duration == 0.
+    result.durationSec = durationSec;
 
     if (!result.peaks.isEmpty()) {
         QMutexLocker lock(&g_waveformCacheMutex);
@@ -238,9 +267,9 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     av_frame_free(&frame);
     av_packet_free(&packet);
     swr_free(&swr);
+    av_channel_layout_uninit(&monoLayout);
     avcodec_free_context(&codecCtx);
     avformat_close_input(&fmtCtx);
 
-    result.durationSec = durationSec;
     return result;
 }
