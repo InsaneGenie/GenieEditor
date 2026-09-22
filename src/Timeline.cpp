@@ -73,7 +73,23 @@ void Timeline::setPlayheadSec(double seconds) {
     const bool columnMoved = secToX(previous) != secToX(m_playheadSec);
     const bool timecodeMoved =
         static_cast<qint64>(previous * 10.0) != static_cast<qint64>(m_playheadSec * 10.0);
-    if (columnMoved || timecodeMoved) update();
+    if (!columnMoved && !timecodeMoved) return;
+
+    // And only the strips around the old and new needle, not the whole view.
+    // The playhead is the only thing in paintEvent that depends on
+    // m_playheadSec, so everything outside these two strips would repaint to
+    // exactly what's already there. The half-width covers the timecode
+    // capsule, including where it's pushed sideways at the widget's edges.
+    constexpr int kHalfStrip = 120;
+    const int oldX = secToX(previous);
+    const int newX = secToX(m_playheadSec);
+    if (std::abs(newX - oldX) <= kHalfStrip * 2) {
+        update(QRect(std::min(oldX, newX) - kHalfStrip, 0,
+                     std::abs(newX - oldX) + 2 * kHalfStrip, height()));
+    } else {
+        update(QRect(oldX - kHalfStrip, 0, 2 * kHalfStrip, height()));
+        update(QRect(newX - kHalfStrip, 0, 2 * kHalfStrip, height()));
+    }
 }
 
 void Timeline::setVerticalScrollOffset(int px) {
@@ -368,7 +384,7 @@ void drawWaveform(QPainter& p, const QRect& bodyRect, const QRect& viewportRect,
 // Draws a clip's video filmstrip inside its body rect, using the same
 // "generate once over the whole file, re-slice on trim" pattern as the
 // waveform above.
-void drawThumbnails(QPainter& p, const QRect& bodyRect, const Clip& clip) {
+void drawThumbnails(QPainter& p, const QRect& bodyRect, const QRect& exposed, const Clip& clip) {
     if (clip.thumbnails.isEmpty() || clip.thumbnailSourceDurationSec <= 0.0 || bodyRect.width() <= 0) {
         return;
     }
@@ -386,6 +402,11 @@ void drawThumbnails(QPainter& p, const QRect& bodyRect, const Clip& clip) {
     for (int i = 0; i < count; ++i) {
         const int cellX = bodyRect.left() + i * cellWidth;
         const int w = (i == count - 1) ? (bodyRect.right() - cellX + 1) : cellWidth;
+        // Only cells that are on screen: a clip spanning an 80-hour file can
+        // be millions of pixels wide, and drawImage still scales each image
+        // even when the result is clipped away.
+        if (cellX + w < exposed.left()) continue;
+        if (cellX > exposed.right()) break;
         const QRect cell(cellX, bodyRect.top(), w, bodyRect.height());
         p.drawImage(cell, clip.thumbnails[startIdx + i]);
     }
@@ -446,6 +467,23 @@ void Timeline::paintEvent(QPaintEvent* event) {
     const double tickIntervalSec = niceTickIntervalSeconds(m_pxPerSec, /*minPixelSpacing=*/78.0);
     const double minorIntervalSec = tickIntervalSec / 4.0;
 
+    // The part of the widget actually being repainted. This widget is as wide
+    // as the whole project — 80 hours at 60 px/s is over 17 million pixels —
+    // so anything that loops "from 0 to width()" does work proportional to the
+    // PROJECT, not the screen, on every repaint including every playhead
+    // step. Qt already clips event->rect() to what's visible in the scroll
+    // area, so bounding every loop by it makes paint cost proportional to the
+    // viewport regardless of project length.
+    const QRect exposed = event->rect();
+
+    // First tick at or before `leadPx` pixels left of the exposed area. Ticks
+    // are stepped by INDEX (sec = k * interval) rather than by accumulating
+    // `sec += interval`: over hundreds of thousands of ticks the accumulated
+    // float error drifts labels visibly off their marks.
+    auto firstTickIndex = [&](double intervalSec, int leadPx) {
+        return static_cast<qint64>(std::floor(std::max(0.0, xToSec(exposed.left() - leadPx)) / intervalSec));
+    };
+
     // -------------------------------------------------------------------
     // Track lanes
     // -------------------------------------------------------------------
@@ -486,8 +524,9 @@ void Timeline::paintEvent(QPaintEvent* event) {
         QColor gridColor = Theme::line();
         gridColor.setAlpha(70);
         p.setPen(QPen(gridColor, 1));
-        for (double sec = 0; secToX(sec) < width(); sec += tickIntervalSec) {
-            const int x = secToX(sec);
+        for (qint64 k = firstTickIndex(tickIntervalSec, 0); ; ++k) {
+            const int x = secToX(k * tickIntervalSec);
+            if (x > exposed.right()) break;
             if (x <= 0) continue;
             p.drawLine(x, kRulerHeight, x, contentBottom);
         }
@@ -517,7 +556,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
             const int x = secToX(clip.trackPosSec);
             const int w = std::max(4, secToX(clip.durationSec()));
             const QRect r(x, y + kClipVMargin, w, trackHeight - 2 * kClipVMargin - 1);
-            if (r.right() < 0 || r.left() > width()) continue; // off-screen — skip the work entirely
+            if (r.right() < exposed.left() || r.left() > exposed.right()) continue; // off-screen — skip the work entirely
 
             const QPainterPath clipPath = roundedPath(r, kClipRadius);
 
@@ -550,7 +589,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
                 // repainted, which is what the waveform should cost.
                 drawWaveform(p, bodyRect, event->rect(), clip, palette.accent);
             } else if (track.type == TrackType::Video) {
-                drawThumbnails(p, bodyRect, clip);
+                drawThumbnails(p, bodyRect, exposed, clip);
 
                 // Level-of-detail: request a higher-resolution thumbnail strip
                 // if the current cached one can't fill this clip's on-screen
@@ -716,15 +755,17 @@ void Timeline::paintEvent(QPaintEvent* event) {
         QColor minorColor = Theme::textFaint();
         minorColor.setAlpha(110);
         p.setPen(QPen(minorColor, 1));
-        for (double sec = 0; secToX(sec) < width(); sec += minorIntervalSec) {
-            const int x = secToX(sec);
+        for (qint64 k = firstTickIndex(minorIntervalSec, 0); ; ++k) {
+            const int x = secToX(k * minorIntervalSec);
+            if (x > exposed.right()) break;
             p.drawLine(x, tickBottom - 4, x, tickBottom);
         }
     }
 
     p.setPen(QPen(Theme::textFaint(), 1));
-    for (double sec = 0; secToX(sec) < width(); sec += tickIntervalSec) {
-        const int x = secToX(sec);
+    for (qint64 k = firstTickIndex(tickIntervalSec, 0); ; ++k) {
+        const int x = secToX(k * tickIntervalSec);
+        if (x > exposed.right()) break;
         p.drawLine(x, tickBottom - 8, x, tickBottom);
     }
 
@@ -732,8 +773,12 @@ void Timeline::paintEvent(QPaintEvent* event) {
     // a stable rhythm instead of shifting as the numbers change width.
     p.setFont(Theme::monoFont(-2));
     p.setPen(Theme::textDim());
-    for (double sec = 0; secToX(sec) < width(); sec += tickIntervalSec) {
+    // Lead of one label width, so a label whose tick sits just left of the
+    // exposed area still gets its visible tail drawn.
+    for (qint64 k = firstTickIndex(tickIntervalSec, 95); ; ++k) {
+        const double sec = k * tickIntervalSec;
         const int x = secToX(sec);
+        if (x > exposed.right()) break;
         p.drawText(QRect(x + 5, rulerTop + 2, 90, 13), Qt::AlignLeft | Qt::AlignVCenter, formatTickLabel(sec));
     }
 
@@ -747,6 +792,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
         if (marker.isPin()) continue; // pins are drawn separately, below
         const int x1 = secToX(marker.startSec);
         const int x2 = secToX(marker.endSec);
+        if (std::max(x1 + 3, x2) < exposed.left() || x1 > exposed.right()) continue;
         const QRect band(x1, rulerBottom - kMarkerBandHeight - 1,
                          std::max(3, x2 - x1), kMarkerBandHeight);
         p.setPen(Qt::NoPen);
@@ -773,7 +819,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
     for (const auto& marker : m_project->markers) {
         if (!marker.isPin()) continue;
         const int x = secToX(marker.startSec);
-        if (x < -kPinWidth || x > width() + kPinWidth) continue;
+        if (x < exposed.left() - kPinWidth || x > exposed.right() + kPinWidth) continue;
 
         // A dark line first, then the coloured dashes on top of it. Without the
         // underlay the guide disappears wherever it crosses a clip that happens
@@ -831,7 +877,7 @@ void Timeline::paintEvent(QPaintEvent* event) {
             const DowntimeRegion& region = m_downtimeRegions[i];
             const int x0 = secToX(region.startSec);
             const int x1 = std::max(x0 + 1, secToX(region.endSec));
-            if (x1 < 0 || x0 > width()) continue;
+            if (x1 < exposed.left() || x0 > exposed.right()) continue;
             const QRect band(x0, rulerBottom, x1 - x0, contentBottom - rulerBottom);
 
             p.fillRect(band, wash);

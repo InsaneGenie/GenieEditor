@@ -1676,6 +1676,7 @@ void MainWindow::startNextTranscriptionJob() {
         transcriber.setProgressCallback([&promise](int percent) {
             if (!promise.isCanceled()) promise.setProgressValue(percent);
         });
+        transcriber.setCancelCheck([&promise] { return promise.isCanceled(); });
         promise.addResult(transcriber.transcribe(source));
     }));
 }

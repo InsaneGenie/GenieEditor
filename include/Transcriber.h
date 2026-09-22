@@ -33,6 +33,11 @@ public:
     // Extracts audio from mediaPath (via FFmpeg, resampled to 16kHz mono —
     // whisper's required input format) and runs it through whisper.cpp.
     // Blocking call; run this on a worker thread in the UI.
+    //
+    // Audio is streamed and transcribed in overlapping ~10-minute windows, so
+    // memory stays flat (a few tens of MB) however long the file is — see the
+    // windowing notes in Transcriber.cpp. Timestamps in the result are always
+    // relative to the start of the FILE, exactly as before.
     QVector<TranscriptSegment> transcribe(const QString& mediaPath);
 
     bool isModelLoaded() const;
@@ -48,6 +53,12 @@ public:
     // any thread).
     void setProgressCallback(std::function<void(int)> callback);
 
+    // Polled between windows and inside whisper's own inference loop; returning
+    // true stops the job promptly and transcribe() returns an empty result.
+    // Matters at this scale: an 80-hour file is hours of work, and without this
+    // there was no way to stop it short of quitting.
+    void setCancelCheck(std::function<bool()> check);
+
 private:
     static void progressTrampoline(whisper_context* ctx, whisper_state* state, int progress, void* userData);
 
@@ -55,4 +66,11 @@ private:
     Impl* m_impl = nullptr;
     QString m_error;
     std::function<void(int)> m_progressCallback;
+    std::function<bool()> m_cancelCheck;
+
+    // Where the window being transcribed sits in the file, for scaling
+    // whisper's per-window progress into whole-file progress.
+    long long m_totalSamples = 0;
+    long long m_windowStartSample = 0;
+    long long m_windowSamples = 0;
 };
