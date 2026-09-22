@@ -88,15 +88,11 @@ add_executable(GenieEditor
     include/Transcriber.h
     ${GENIE_SOURCE_DIR}/MediaProbe.cpp
     include/MediaProbe.h
+    ${GENIE_SOURCE_DIR}/MotionAnalyzer.cpp
+    include/MotionAnalyzer.h
     ${GENIE_SOURCE_DIR}/WaveformGenerator.cpp
     include/WaveformGenerator.h
-<<<<<<< ours
     ${GENIE_SOURCE_DIR}/TrackHeaderPanel.cpp
-=======
-    src/MotionAnalyzer.cpp
-    include/MotionAnalyzer.h
-    src/TrackHeaderPanel.cpp
->>>>>>> theirs
     include/TrackHeaderPanel.h
     include/TimelineMetrics.h
     ${GENIE_SOURCE_DIR}/ThumbnailGenerator.cpp
