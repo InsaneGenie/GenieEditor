@@ -106,8 +106,14 @@ public:
 
     // Builds the complete filter graph plus the input arguments it refers to.
     // Kept separate from execution so it can be tested without rendering.
+    //
+    // `totalOverrideSec` fixes the output length instead of deriving it from
+    // the clips (a chunk of a longer render can end in a gap). With
+    // `forceStereoAudio` the audio is always present and always 48kHz stereo
+    // s16 — silent if there's nothing to play — so chunks can be joined.
     static QString buildFilterGraph(const Project& project, const Options& options,
-                                    QStringList* inputArgs, bool* hasAudio);
+                                    QStringList* inputArgs, bool* hasAudio,
+                                    double totalOverrideSec = -1.0, bool forceStereoAudio = false);
 
 private:
     QString m_error;
