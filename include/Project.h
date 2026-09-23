@@ -6,6 +6,7 @@
 #include <QImage>
 #include <memory>
 #include <cmath>
+#include <algorithm>
 
 // One keyframe: a value pinned to a moment. Times are relative to the CLIP's
 // own start, not the project timeline, so dragging a clip carries its animation
@@ -176,6 +177,15 @@ struct Clip {
 
     // Only meaningful for clips on an Overlay track; ignored everywhere else.
     OverlayAnimation anim;
+
+    // Clips sharing a non-zero id form a GROUP: selecting any member selects
+    // them all, so they move, delete, copy and change speed together. 0 means
+    // ungrouped. Ids have no meaning beyond equality — see Project::nextGroupId.
+    //
+    // Carried along by splits and ripple deletes (both halves of a split
+    // grouped clip stay in the group), and REMAPPED on paste so a pasted copy
+    // forms its own group rather than joining the original's.
+    int groupId = 0;
 
     // Rate limits. The floor is above zero because a clip at 0x occupies
     // infinite timeline, and the ceiling is where mpv and ffmpeg both stop
@@ -405,4 +415,12 @@ public:
 
     // Total project duration = end of the furthest clip across all tracks.
     double durationSec() const;
+
+    // An id no clip is using yet, for forming a new group.
+    int nextGroupId() const {
+        int highest = 0;
+        for (const auto& t : tracks)
+            for (const auto& c : t.clips) highest = std::max(highest, c.groupId);
+        return highest + 1;
+    }
 };

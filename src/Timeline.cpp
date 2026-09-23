@@ -161,6 +161,71 @@ void Timeline::clearSelection() {
     update();
 }
 
+QSet<qint64> Timeline::groupMembersOf(int trackIndex, int clipIndex) const {
+    QSet<qint64> members;
+    if (!m_project || trackIndex < 0 || trackIndex >= m_project->tracks.size()) return members;
+    const auto& clips = m_project->tracks[trackIndex].clips;
+    if (clipIndex < 0 || clipIndex >= clips.size()) return members;
+
+    const int groupId = clips[clipIndex].groupId;
+    if (groupId == 0) {
+        members.insert(clipKey(trackIndex, clipIndex));
+        return members;
+    }
+    for (int t = 0; t < m_project->tracks.size(); ++t) {
+        const auto& trackClips = m_project->tracks[t].clips;
+        for (int c = 0; c < trackClips.size(); ++c) {
+            if (trackClips[c].groupId == groupId) members.insert(clipKey(t, c));
+        }
+    }
+    return members;
+}
+
+void Timeline::selectAllClips() {
+    if (!m_project) return;
+    m_selectedClipKeys.clear();
+    for (int t = 0; t < m_project->tracks.size(); ++t) {
+        for (int c = 0; c < m_project->tracks[t].clips.size(); ++c) m_selectedClipKeys.insert(clipKey(t, c));
+    }
+    update();
+}
+
+bool Timeline::groupSelection() {
+    if (!m_project || m_selectedClipKeys.size() < 2) return false;
+    // One fresh id for the whole selection, even if it already spans existing
+    // groups: grouping two groups together is how you build a bigger one.
+    const int id = m_project->nextGroupId();
+    for (qint64 key : m_selectedClipKeys) {
+        const int t = static_cast<int>(key >> 32);
+        const int c = static_cast<int>(key & 0xffffffffLL);
+        if (t < 0 || t >= m_project->tracks.size()) continue;
+        auto& clips = m_project->tracks[t].clips;
+        if (c >= 0 && c < clips.size()) clips[c].groupId = id;
+    }
+    update();
+    emit projectModified();
+    return true;
+}
+
+bool Timeline::ungroupSelection() {
+    if (!m_project) return false;
+    bool changed = false;
+    for (qint64 key : m_selectedClipKeys) {
+        const int t = static_cast<int>(key >> 32);
+        const int c = static_cast<int>(key & 0xffffffffLL);
+        if (t < 0 || t >= m_project->tracks.size()) continue;
+        auto& clips = m_project->tracks[t].clips;
+        if (c >= 0 && c < clips.size() && clips[c].groupId != 0) {
+            clips[c].groupId = 0;
+            changed = true;
+        }
+    }
+    if (!changed) return false;
+    update();
+    emit projectModified();
+    return true;
+}
+
 namespace {
 // Picks a "nice" tick spacing (in seconds) so labels never crowd together,
 // regardless of zoom level. Steps up through human-friendly intervals —
@@ -692,6 +757,18 @@ void Timeline::paintEvent(QPaintEvent* event) {
                     p.setBrush(Theme::now());
                     p.drawPolygon(diamond);
                 }
+                p.restore();
+            }
+
+            // Group stripe: a band along the clip's bottom edge in a colour
+            // unique to its group, so which clips belong together is visible
+            // without clicking anything. Hue steps by the golden angle so
+            // consecutive ids land far apart on the wheel.
+            if (clip.groupId != 0 && r.height() > 10) {
+                const QColor groupColor = QColor::fromHsv((clip.groupId * 137) % 360, 150, 240);
+                p.save();
+                p.setClipPath(clipPath);
+                p.fillRect(QRect(r.left(), r.bottom() - 3, r.width(), 4), groupColor);
                 p.restore();
             }
 
@@ -1389,13 +1466,19 @@ void Timeline::mousePressEvent(QMouseEvent* event) {
 
     const qint64 key = clipKey(hit.trackIndex, hit.clipIndex);
 
+    // Alt+click reaches inside a group to select one member on its own —
+    // the way to trim or nudge a single clip without ungrouping.
+    const bool singleMember = event->modifiers() & Qt::AltModifier;
+    const QSet<qint64> clickedSet = singleMember ? QSet<qint64>{key}
+                                                 : groupMembersOf(hit.trackIndex, hit.clipIndex);
+
     if (event->modifiers() & Qt::ControlModifier) {
-        // Toggle this clip's membership without touching the rest of the
-        // selection — standard multi-select convention.
+        // Toggle this clip's membership — its whole group's, if it's in one —
+        // without touching the rest of the selection.
         if (m_selectedClipKeys.contains(key)) {
-            m_selectedClipKeys.remove(key);
+            m_selectedClipKeys -= clickedSet;
         } else {
-            m_selectedClipKeys.insert(key);
+            m_selectedClipKeys += clickedSet;
         }
         update();
         emit clipSelected(hit.trackIndex, hit.clipIndex);
@@ -1403,13 +1486,12 @@ void Timeline::mousePressEvent(QMouseEvent* event) {
         return;
     }
 
-    if (!m_selectedClipKeys.contains(key)) {
+    if (singleMember || !m_selectedClipKeys.contains(key)) {
         // Fresh click on a clip outside the current selection starts a new
         // single selection. Clicking an ALREADY-selected clip (no
         // modifier) intentionally keeps the whole group selected, so
         // grabbing any member of a multi-selection drags the group.
-        m_selectedClipKeys.clear();
-        m_selectedClipKeys.insert(key);
+        m_selectedClipKeys = clickedSet;
     }
     update();
     emit clipSelected(hit.trackIndex, hit.clipIndex);
@@ -1649,10 +1731,9 @@ void Timeline::leaveEvent(QEvent*) {
 }
 
 void Timeline::setSelectedClip(int trackIndex, int clipIndex) {
-    const qint64 key = clipKey(trackIndex, clipIndex);
-    if (m_selectedClipKeys.size() == 1 && m_selectedClipKeys.contains(key)) return;
-    m_selectedClipKeys.clear();
-    m_selectedClipKeys.insert(key);
+    const QSet<qint64> wanted = groupMembersOf(trackIndex, clipIndex);
+    if (m_selectedClipKeys == wanted) return;
+    m_selectedClipKeys = wanted;
     update();
 }
 
@@ -1848,6 +1929,7 @@ void Timeline::keyPressEvent(QKeyEvent* event) {
         case Qt::Key_X: cutSelection();       event->accept(); return;
         case Qt::Key_V: pasteAtPlayhead();    event->accept(); return;
         case Qt::Key_D: duplicateSelection(); event->accept(); return;
+        case Qt::Key_A: selectAllClips();     event->accept(); return;
         default: break;
         }
     }
@@ -1877,8 +1959,7 @@ void Timeline::contextMenuEvent(QContextMenuEvent* event) {
     // Right-clicking an already-selected clip leaves the whole group
     // selected, so "Delete" in the menu acts on the full group.
     if (!m_selectedClipKeys.contains(key)) {
-        m_selectedClipKeys.clear();
-        m_selectedClipKeys.insert(key);
+        m_selectedClipKeys = groupMembersOf(hit.trackIndex, hit.clipIndex);
         update();
         emit clipSelected(hit.trackIndex, hit.clipIndex);
     }
@@ -1943,6 +2024,25 @@ void Timeline::contextMenuEvent(QContextMenuEvent* event) {
     QAction* dupAct = menu.addAction("Duplicate");
     dupAct->setShortcut(QKeySequence("Ctrl+D"));
     connect(dupAct, &QAction::triggered, this, [this] { duplicateSelection(); });
+
+    menu.addSeparator();
+
+    bool anyGrouped = false;
+    for (qint64 k : m_selectedClipKeys) {
+        const int t = static_cast<int>(k >> 32);
+        const int c = static_cast<int>(k & 0xffffffffLL);
+        if (t >= 0 && t < m_project->tracks.size() && c >= 0 && c < m_project->tracks[t].clips.size()
+            && m_project->tracks[t].clips[c].groupId != 0) { anyGrouped = true; break; }
+    }
+    QAction* groupAct = menu.addAction("Group");
+    groupAct->setShortcut(QKeySequence("Ctrl+G"));
+    groupAct->setEnabled(selectionCount >= 2);
+    connect(groupAct, &QAction::triggered, this, [this] { groupSelection(); });
+
+    QAction* ungroupAct = menu.addAction("Ungroup");
+    ungroupAct->setShortcut(QKeySequence("Ctrl+Shift+G"));
+    ungroupAct->setEnabled(anyGrouped);
+    connect(ungroupAct, &QAction::triggered, this, [this] { ungroupSelection(); });
 
     menu.addSeparator();
 
@@ -2073,6 +2173,11 @@ void Timeline::pasteAtPlayhead() {
 
     QSet<qint64> pasted;
     bool changed = false;
+    // Pasted copies of a group form a NEW group of their own. Keeping the old
+    // id would silently join them to the originals, so selecting either would
+    // grab both.
+    QHash<int, int> groupRemap;
+    int nextGroup = m_project->nextGroupId();
 
     for (const ClipboardEntry& entry : m_clipboard) {
         const int typeIndex = static_cast<int>(entry.trackType);
@@ -2092,6 +2197,11 @@ void Timeline::pasteAtPlayhead() {
 
         Clip copy = entry.clip;
         copy.trackPosSec = std::max(0.0, m_playheadSec + entry.timeOffsetSec);
+        if (copy.groupId != 0) {
+            auto it = groupRemap.find(copy.groupId);
+            if (it == groupRemap.end()) it = groupRemap.insert(copy.groupId, nextGroup++);
+            copy.groupId = it.value();
+        }
 
         m_project->tracks[destTrack].clips.push_back(copy);
         pasted.insert(clipKey(destTrack, m_project->tracks[destTrack].clips.size() - 1));

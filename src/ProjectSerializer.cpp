@@ -160,6 +160,8 @@ bool ProjectSerializer::save(const Project& project, const QString& path,
             // Only written when it isn't the default, so an ordinary project
             // file stays free of a "speed": 1 on every clip.
             if (clip.speed != 1.0) clipObj["speed"] = clip.speed;
+            // Same convention: ungrouped clips (the vast majority) write nothing.
+            if (clip.groupId != 0) clipObj["group"] = clip.groupId;
 
             // Only overlay clips use the animation block, and writing five
             // default-valued property objects for every video clip in a long
@@ -279,6 +281,7 @@ ProjectSerializer::LoadResult ProjectSerializer::load(Project& project, const QS
             // Absent means 1.0, which is what makes files written before speed
             // existed load as ordinary full-rate clips.
             clip.speed = clipObj["speed"].toDouble(1.0);
+            clip.groupId = clipObj["group"].toInt(0); // absent in files from before grouping
 
             if (clipObj.contains("anim")) {
                 const QJsonObject anim = clipObj["anim"].toObject();

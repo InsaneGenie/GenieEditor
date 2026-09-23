@@ -520,11 +520,20 @@ private:
     };
     QHash<int, OverlayRenderCache> m_overlayCacheByTrack;
 
-    // Clips (encoded as (trackIndex << 32) | clipIndex) currently
-    // regenerating a higher-resolution thumbnail strip in the background —
-    // see onThumbnailDetailNeeded. Prevents queuing duplicate jobs for the
-    // same clip while one is already in flight.
-    QSet<qint64> m_pendingThumbnailUpgrades;
+    // Visual generation, per source FILE. m_waveformJobs holds files with a
+    // decode in flight; m_thumbnailJobs maps each file to the strip size being
+    // generated for it, so a request for the same or coarser detail is a
+    // no-op while a finer one can still be started.
+    QSet<QString> m_waveformJobs;
+    QHash<QString, int> m_thumbnailJobs;
+    class QThreadPool* m_visualsPool = nullptr;
+    static constexpr int kBaseThumbnailCount = 12;
+    void requestWaveform(const QString& path);
+    void requestThumbnails(const QString& path, int frameCount);
+
+    QAction* m_selectAllClipsAction = nullptr;
+    QAction* m_groupAction = nullptr;
+    QAction* m_ungroupAction = nullptr;
 
     // The authoritative timeline position — see the architecture note above.
     double m_currentTimelineSec = 0.0;

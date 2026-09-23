@@ -1,4 +1,5 @@
 #include "WaveformGenerator.h"
+#include "VisualDiskCache.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -107,6 +108,19 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
         }
     }
 
+    // Then disk: a file decoded in any earlier session is read back in
+    // milliseconds instead of re-decoding its entire audio stream.
+    {
+        WaveformData fromDisk;
+        if (VisualDiskCache::loadWaveform(path, requestedPeakCount, &fromDisk)) {
+            QMutexLocker lock(&g_waveformCacheMutex);
+            g_waveformCache.insert(path, WaveformCacheEntry{
+                fromDisk, modifiedMs, sizeBytes, requestedPeakCount, ++g_waveformUseCounter});
+            trimWaveformCache();
+            return fromDisk;
+        }
+    }
+
     AVFormatContext* fmtCtx = nullptr;
     const QByteArray pathUtf8 = path.toUtf8();
     if (avformat_open_input(&fmtCtx, pathUtf8.constData(), nullptr, nullptr) != 0) {
@@ -125,6 +139,14 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     }
 
     AVStream* stream = fmtCtx->streams[audioStreamIndex];
+
+    // Every other stream is dropped at the demuxer. For a video file the
+    // video packets are nearly all of its bytes; without this each one was
+    // read off disk and handed back to be thrown away, which for a long
+    // recording cost more than decoding the audio itself.
+    for (unsigned i = 0; i < fmtCtx->nb_streams; ++i) {
+        if (static_cast<int>(i) != audioStreamIndex) fmtCtx->streams[i]->discard = AVDISCARD_ALL;
+    }
 
     double durationSec = 0.0;
     if (fmtCtx->duration != AV_NOPTS_VALUE) {
@@ -258,10 +280,13 @@ WaveformData WaveformGenerator::generate(const QString& path, int peakCount) {
     result.durationSec = durationSec;
 
     if (!result.peaks.isEmpty()) {
-        QMutexLocker lock(&g_waveformCacheMutex);
-        g_waveformCache.insert(path, WaveformCacheEntry{
-            result, modifiedMs, sizeBytes, requestedPeakCount, ++g_waveformUseCounter});
-        trimWaveformCache();
+        {
+            QMutexLocker lock(&g_waveformCacheMutex);
+            g_waveformCache.insert(path, WaveformCacheEntry{
+                result, modifiedMs, sizeBytes, requestedPeakCount, ++g_waveformUseCounter});
+            trimWaveformCache();
+        }
+        VisualDiskCache::saveWaveform(path, requestedPeakCount, result);
     }
 
     av_frame_free(&frame);

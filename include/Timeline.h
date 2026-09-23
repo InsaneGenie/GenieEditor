@@ -90,6 +90,18 @@ public:
     // tracks have shifted.
     void clearSelection();
 
+    // Selects every clip on every track (Ctrl+A).
+    void selectAllClips();
+
+    // Groups the current selection into one new group (merging any groups it
+    // already spans), or dissolves every group the selection touches. Both
+    // return false and change nothing when there's nothing to act on — fewer
+    // than two clips to group, or no grouped clip selected. On success the
+    // Project is modified and projectModified is emitted, like any other edit.
+    bool groupSelection();
+    bool ungroupSelection();
+    int selectedClipCount() const { return m_selectedClipKeys.size(); }
+
     // Still sections to highlight, each drawn as a hatched band across every
     // lane with its own remove button. Replaces whatever was shown before; an
     // empty vector clears them. The Timeline only DISPLAYS these — removing
@@ -290,6 +302,12 @@ private:
     // LENGTH follows from the rate.
     void applySpeedToSelection(double speed);
     void updateCursorForPosition(const QPoint& pos);
+
+    // The clip itself plus every other member of its group (just the clip,
+    // if it's ungrouped). Every user-driven selection goes through this,
+    // which is what makes a group behave as one object — except Alt+click,
+    // which deliberately selects a single member on its own.
+    QSet<qint64> groupMembersOf(int trackIndex, int clipIndex) const;
     void deleteClip(int trackIndex, int clipIndex);
     void deleteSelectedClips();
 

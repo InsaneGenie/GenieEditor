@@ -92,6 +92,8 @@ add_executable(GenieEditor
     include/MotionAnalyzer.h
     ${GENIE_SOURCE_DIR}/WaveformGenerator.cpp
     include/WaveformGenerator.h
+    ${GENIE_SOURCE_DIR}/VisualDiskCache.cpp
+    include/VisualDiskCache.h
     ${GENIE_SOURCE_DIR}/TrackHeaderPanel.cpp
     include/TrackHeaderPanel.h
     include/TimelineMetrics.h

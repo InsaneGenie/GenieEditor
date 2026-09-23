@@ -52,6 +52,8 @@
 #include <QCloseEvent>
 #include <QTimer>
 #include <QFutureWatcher>
+#include <QThreadPool>
+#include <QThread>
 #include <QtConcurrent>
 #include <QHash>
 #include <QPair>
@@ -69,6 +71,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <algorithm>
+#include <iterator>
 #include <thread>
 #include <cmath>
 
@@ -87,6 +90,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             setupAudioPlayerForTrack(i);
         }
     }
+
+    // Waveforms and filmstrips get their own small, low-priority pool rather
+    // than the global one. The global pool is sized to every core, so opening
+    // a project with a dozen source files started a dozen full decodes at
+    // once and pinned the whole CPU. Two workers at low priority finish the
+    // same work a little later while playback and the UI stay responsive.
+    m_visualsPool = new QThreadPool(this);
+    m_visualsPool->setMaxThreadCount(2);
+    m_visualsPool->setThreadPriority(QThread::LowPriority);
 
     m_masterClockTimer = new QTimer(this);
     m_masterClockTimer->setInterval(16); // matches PlayerWidget's own mpv-poll rate
@@ -269,6 +281,44 @@ void MainWindow::buildUi() {
     stripLayout->addWidget(redoButton);
     stripLayout->addWidget(splitButton);
     stripLayout->addWidget(pinButton);
+
+    // Select All / Group / Ungroup. Application-scoped like Split and Pin so
+    // they work wherever focus is — Ctrl+A in a text field still selects that
+    // field's text, because QLineEdit claims its own standard shortcuts first.
+    m_selectAllClipsAction = new QAction("Select All Clips", this);
+    m_selectAllClipsAction->setShortcut(QKeySequence::SelectAll);
+    m_selectAllClipsAction->setShortcutContext(Qt::ApplicationShortcut);
+    connect(m_selectAllClipsAction, &QAction::triggered, this, [this] { m_timeline->selectAllClips(); });
+    addAction(m_selectAllClipsAction);
+
+    m_groupAction = new QAction("Group", this);
+    m_groupAction->setToolTip("Group the selected clips so they select and move together  (Ctrl+G)\n"
+                              "Alt+click selects one clip inside a group");
+    m_groupAction->setShortcut(QKeySequence("Ctrl+G"));
+    m_groupAction->setShortcutContext(Qt::ApplicationShortcut);
+    connect(m_groupAction, &QAction::triggered, this, [this] {
+        if (!m_timeline->groupSelection())
+            statusBar()->showMessage("Select two or more clips to group", 3000);
+    });
+    addAction(m_groupAction);
+
+    m_ungroupAction = new QAction("Ungroup", this);
+    m_ungroupAction->setToolTip("Break apart any groups in the selection  (Ctrl+Shift+G)");
+    m_ungroupAction->setShortcut(QKeySequence("Ctrl+Shift+G"));
+    m_ungroupAction->setShortcutContext(Qt::ApplicationShortcut);
+    connect(m_ungroupAction, &QAction::triggered, this, [this] {
+        if (!m_timeline->ungroupSelection())
+            statusBar()->showMessage("No grouped clips are selected", 3000);
+    });
+    addAction(m_ungroupAction);
+
+    for (QAction* action : {m_groupAction, m_ungroupAction}) {
+        auto* button = new QToolButton();
+        button->setDefaultAction(action);
+        button->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        button->setCursor(Qt::PointingHandCursor);
+        stripLayout->addWidget(button);
+    }
 
     // Downtime: find still sections, then clear them all at once. Each band on
     // the timeline also carries its own remove button for picking one by one.
@@ -780,6 +830,10 @@ void MainWindow::buildMenus() {
     editMenu->addAction(m_undoAction);
     editMenu->addAction(m_redoAction);
     editMenu->addSeparator();
+    editMenu->addAction(m_selectAllClipsAction);
+    editMenu->addAction(m_groupAction);
+    editMenu->addAction(m_ungroupAction);
+    editMenu->addSeparator();
     editMenu->addAction(m_findDowntimeAction);
     editMenu->addAction(m_removeAllDowntimeAction);
 
@@ -921,7 +975,6 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
     videoClip.sourceOutSec = duration;
     videoClip.trackPosSec = trackPosSec;
     m_project.tracks[videoTrackIndex].clips.push_back(videoClip);
-    const int videoClipIndex = m_project.tracks[videoTrackIndex].clips.size() - 1;
 
     int audioClipIndex = -1;
     if (sourceHasAudio) {
@@ -937,44 +990,12 @@ void MainWindow::importVideoFileAt(const QString& path, int videoTrackIndex, dou
     m_timeline->setProject(&m_project); // clip appears immediately, just without visuals yet
     seekTimeline(trackPosSec); // preview the newly imported clip
 
-    // Background thumbnail generation. Guards against the clip having been
-    // deleted or the index no longer matching this exact file (e.g. clips
-    // removed before this finishes) by re-checking both before writing back.
-    auto* thumbWatcher = new QFutureWatcher<ThumbnailStrip>(this);
-    connect(thumbWatcher, &QFutureWatcher<ThumbnailStrip>::finished, this,
-            [this, thumbWatcher, path, videoTrackIndex, videoClipIndex] {
-        const ThumbnailStrip strip = thumbWatcher->result();
-        thumbWatcher->deleteLater();
-        auto& clips = m_project.tracks[videoTrackIndex].clips;
-        if (videoClipIndex >= 0 && videoClipIndex < clips.size() && clips[videoClipIndex].sourcePath == path) {
-            Clip& c = clips[videoClipIndex];
-            c.thumbnails = strip.frames;
-            c.thumbnailSourceDurationSec = strip.durationSec > 0.0 ? strip.durationSec : c.sourceDurationSec();
-            m_timeline->update();
-        }
-    });
-    thumbWatcher->setFuture(QtConcurrent::run(&ThumbnailGenerator::generate, path, 12, 120, 68));
-
-    // Background waveform generation, same pattern — skipped entirely when
-    // there's no audio clip, since a full audio decode of a file with no audio
-    // can only ever produce an empty result.
-    if (audioClipIndex >= 0) {
-        auto* waveWatcher = new QFutureWatcher<WaveformData>(this);
-        connect(waveWatcher, &QFutureWatcher<WaveformData>::finished, this,
-                [this, waveWatcher, path, audioTrackIndex, audioClipIndex] {
-            const WaveformData waveform = waveWatcher->result();
-            waveWatcher->deleteLater();
-            auto& clips = m_project.tracks[audioTrackIndex].clips;
-            if (audioClipIndex < clips.size() && clips[audioClipIndex].sourcePath == path) {
-                Clip& c = clips[audioClipIndex];
-                c.waveformPeaks = waveform.peaks;
-                c.waveformRms = waveform.rms;
-                c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.sourceDurationSec();
-                m_timeline->update();
-            }
-        });
-        waveWatcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 0));
-    }
+    // Visuals are generated in the background and applied to every clip that
+    // uses this file — see requestThumbnails/requestWaveform. The waveform is
+    // skipped for silent files, whose full audio decode could only produce
+    // an empty result.
+    requestThumbnails(path, kBaseThumbnailCount);
+    if (audioClipIndex >= 0) requestWaveform(path);
 }
 
 void MainWindow::importOverlayFileAt(const QString& path, int overlayTrackIndex, double trackPosSec) {
@@ -1167,26 +1188,11 @@ void MainWindow::importAudioOnlyFileAt(const QString& path, int trackIndex, doub
     audioClip.sourceOutSec = duration;
     audioClip.trackPosSec = trackPosSec;
     m_project.tracks[trackIndex].clips.push_back(audioClip);
-    const int clipIndex = m_project.tracks[trackIndex].clips.size() - 1;
 
     m_timeline->setProject(&m_project);
     seekTimeline(trackPosSec);
 
-    auto* waveWatcher = new QFutureWatcher<WaveformData>(this);
-    connect(waveWatcher, &QFutureWatcher<WaveformData>::finished, this,
-            [this, waveWatcher, path, trackIndex, clipIndex] {
-        const WaveformData waveform = waveWatcher->result();
-        waveWatcher->deleteLater();
-        auto& clips = m_project.tracks[trackIndex].clips;
-        if (clipIndex >= 0 && clipIndex < clips.size() && clips[clipIndex].sourcePath == path) {
-            Clip& c = clips[clipIndex];
-            c.waveformPeaks = waveform.peaks;
-            c.waveformRms = waveform.rms;
-            c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.sourceDurationSec();
-            m_timeline->update();
-        }
-    });
-    waveWatcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 0));
+    requestWaveform(path);
 }
 
 void MainWindow::onMediaDropped(const QString& filePath, int trackIndex, double timelineSec) {
@@ -1221,41 +1227,24 @@ void MainWindow::onMediaDropped(const QString& filePath, int trackIndex, double 
 
 void MainWindow::onThumbnailDetailNeeded(int trackIndex, int clipIndex, int desiredFullFileFrameCount) {
     if (trackIndex < 0 || trackIndex >= m_project.tracks.size()) return;
-    auto& clips = m_project.tracks[trackIndex].clips;
+    const auto& clips = m_project.tracks[trackIndex].clips;
     if (clipIndex < 0 || clipIndex >= clips.size()) return;
-    Clip& clip = clips[clipIndex];
+    const Clip& clip = clips[clipIndex];
 
-    const qint64 key = (static_cast<qint64>(trackIndex) << 32) | static_cast<quint32>(clipIndex);
-    if (m_pendingThumbnailUpgrades.contains(key)) return; // already regenerating this exact clip
+    // Rounded UP to a fixed ladder of resolutions rather than using the exact
+    // count asked for. The timeline asks for a slightly different number at
+    // every zoom step; honouring each one meant a fresh whole-file strip per
+    // step, none of which could be reused from the cache. With a ladder, a
+    // zoom-in costs at most a handful of generations per file, ever, and
+    // each one is cached on disk.
+    static constexpr int kLadder[] = {kBaseThumbnailCount, 25, 50, 100, 200};
+    int count = kLadder[std::size(kLadder) - 1];
+    for (int step : kLadder) {
+        if (step >= desiredFullFileFrameCount) { count = step; break; }
+    }
+    if (count <= clip.thumbnails.size()) return; // already at least this detailed
 
-    // Only worth the decode cost if this is a MEANINGFUL improvement over
-    // what's already cached — avoids re-triggering on every tiny zoom step.
-    if (desiredFullFileFrameCount <= clip.thumbnails.size() * 1.3) return;
-
-    m_pendingThumbnailUpgrades.insert(key);
-    const QString path = clip.sourcePath;
-
-    auto* watcher = new QFutureWatcher<ThumbnailStrip>(this);
-    connect(watcher, &QFutureWatcher<ThumbnailStrip>::finished, this,
-            [this, watcher, path, trackIndex, clipIndex, key] {
-        const ThumbnailStrip strip = watcher->result();
-        watcher->deleteLater();
-        m_pendingThumbnailUpgrades.remove(key);
-
-        if (trackIndex >= m_project.tracks.size()) return;
-        auto& refreshedClips = m_project.tracks[trackIndex].clips;
-        if (clipIndex < 0 || clipIndex >= refreshedClips.size()) return;
-        Clip& c = refreshedClips[clipIndex];
-        // Guards against the clip having been deleted/replaced, or the
-        // user having zoomed back out while this was generating (in which
-        // case the result may no longer actually be an improvement).
-        if (c.sourcePath == path && strip.frames.size() > c.thumbnails.size()) {
-            c.thumbnails = strip.frames;
-            c.thumbnailSourceDurationSec = strip.durationSec > 0.0 ? strip.durationSec : c.sourceDurationSec();
-            m_timeline->update();
-        }
-    });
-    watcher->setFuture(QtConcurrent::run(&ThumbnailGenerator::generate, path, desiredFullFileFrameCount, 120, 68));
+    requestThumbnails(clip.sourcePath, count);
 }
 
 void MainWindow::onTimelineZoomAnchorChanged(double anchorSec, int oldPixelX) {
@@ -2762,7 +2751,6 @@ void MainWindow::adoptLoadedProject(double playheadSec, double pixelsPerSecond) 
     // now stale.
     m_activeOverlayClipByTrack.clear();
     m_overlayCacheByTrack.clear();
-    m_pendingThumbnailUpgrades.clear();
     for (int t = 0; t < m_project.tracks.size(); ++t) m_player->clearOverlay(t + 1);
     setOverlaySelection(-1, -1);
 
@@ -2793,54 +2781,88 @@ void MainWindow::adoptLoadedProject(double playheadSec, double pixelsPerSecond) 
 }
 
 void MainWindow::regenerateAllClipVisuals() {
-    for (int t = 0; t < m_project.tracks.size(); ++t) {
-        const Track& track = m_project.tracks[t];
+    // Per FILE, not per clip. A long recording cut into many pieces is one
+    // file referenced by many clips; asking per clip launched one full decode
+    // per piece, all at once, before any of them could populate the cache —
+    // fifty cuts meant fifty simultaneous decodes of the same 80 hours.
+    //
+    // Only clips still missing their visuals are asked for, so this is also
+    // cheap to call after an undo, which can restore clips captured before
+    // their visuals arrived.
+    QSet<QString> needThumbs;
+    QSet<QString> needWaves;
+    for (const Track& track : m_project.tracks) {
         // Overlay clips have neither a waveform nor a filmstrip — the overlay
         // compositor reads their source directly.
         if (track.type == TrackType::Overlay) continue;
-
-        for (int c = 0; c < track.clips.size(); ++c) {
-            const QString path = track.clips[c].sourcePath;
-            if (path.isEmpty() || !QFileInfo::exists(path)) continue; // relinking is the fix, not a decode error
-
-            if (track.type == TrackType::Video) {
-                auto* watcher = new QFutureWatcher<ThumbnailStrip>(this);
-                connect(watcher, &QFutureWatcher<ThumbnailStrip>::finished, this,
-                        [this, watcher, path, t, c] {
-                    const ThumbnailStrip strip = watcher->result();
-                    watcher->deleteLater();
-                    // Re-checked because the project can be closed, or clips
-                    // deleted, while this is still decoding in the background.
-                    if (t >= m_project.tracks.size()) return;
-                    auto& clips = m_project.tracks[t].clips;
-                    if (c >= clips.size() || clips[c].sourcePath != path) return;
-                    clips[c].thumbnails = strip.frames;
-                    clips[c].thumbnailSourceDurationSec =
-                        strip.durationSec > 0.0 ? strip.durationSec : clips[c].sourceDurationSec();
-                    m_timeline->update();
-                });
-                watcher->setFuture(QtConcurrent::run(&ThumbnailGenerator::generate, path, 12, 120, 68));
-            } else {
-                auto* watcher = new QFutureWatcher<WaveformData>(this);
-                connect(watcher, &QFutureWatcher<WaveformData>::finished, this,
-                        [this, watcher, path, t, c] {
-                    const WaveformData waveform = watcher->result();
-                    watcher->deleteLater();
-                    if (t >= m_project.tracks.size()) return;
-                    auto& clips = m_project.tracks[t].clips;
-                    if (c >= clips.size() || clips[c].sourcePath != path) return;
-                    clips[c].waveformPeaks = waveform.peaks;
-                    clips[c].waveformRms = waveform.rms;
-                    clips[c].waveformSourceDurationSec =
-                        waveform.durationSec > 0.0 ? waveform.durationSec : clips[c].sourceDurationSec();
-                    m_timeline->update();
-                });
-                watcher->setFuture(QtConcurrent::run(&WaveformGenerator::generate, path, 0));
-            }
+        for (const Clip& clip : track.clips) {
+            if (clip.sourcePath.isEmpty() || !QFileInfo::exists(clip.sourcePath)) continue; // relinking is the fix, not a decode error
+            if (track.type == TrackType::Video && clip.thumbnails.isEmpty()) needThumbs.insert(clip.sourcePath);
+            if (track.type == TrackType::Audio && clip.waveformPeaks.isEmpty()) needWaves.insert(clip.sourcePath);
         }
     }
+    for (const QString& path : needThumbs) requestThumbnails(path, kBaseThumbnailCount);
+    for (const QString& path : needWaves) requestWaveform(path);
 }
 
+void MainWindow::requestWaveform(const QString& path) {
+    if (path.isEmpty() || m_waveformJobs.contains(path)) return; // one decode per file at a time
+    m_waveformJobs.insert(path);
+
+    auto* watcher = new QFutureWatcher<WaveformData>(this);
+    connect(watcher, &QFutureWatcher<WaveformData>::finished, this, [this, watcher, path] {
+        const WaveformData waveform = watcher->result();
+        watcher->deleteLater();
+        m_waveformJobs.remove(path);
+
+        // Applied by path to every audio clip using this file, rather than to
+        // the index that asked. Indices go stale the moment anything is
+        // inserted, deleted or undone while the decode runs; the path doesn't.
+        bool applied = false;
+        for (Track& track : m_project.tracks) {
+            if (track.type != TrackType::Audio) continue;
+            for (Clip& c : track.clips) {
+                if (c.sourcePath != path) continue;
+                c.waveformPeaks = waveform.peaks;
+                c.waveformRms = waveform.rms;
+                c.waveformSourceDurationSec = waveform.durationSec > 0.0 ? waveform.durationSec : c.sourceDurationSec();
+                applied = true;
+            }
+        }
+        if (applied) m_timeline->update();
+    });
+    watcher->setFuture(QtConcurrent::run(m_visualsPool, &WaveformGenerator::generate, path, 0));
+}
+
+void MainWindow::requestThumbnails(const QString& path, int frameCount) {
+    if (path.isEmpty()) return;
+    // A job for this file at this detail or better is already running.
+    if (m_thumbnailJobs.value(path, 0) >= frameCount) return;
+    m_thumbnailJobs[path] = frameCount;
+
+    auto* watcher = new QFutureWatcher<ThumbnailStrip>(this);
+    connect(watcher, &QFutureWatcher<ThumbnailStrip>::finished, this, [this, watcher, path, frameCount] {
+        const ThumbnailStrip strip = watcher->result();
+        watcher->deleteLater();
+        if (m_thumbnailJobs.value(path) == frameCount) m_thumbnailJobs.remove(path);
+        if (strip.frames.isEmpty()) return;
+
+        bool applied = false;
+        for (Track& track : m_project.tracks) {
+            if (track.type != TrackType::Video) continue;
+            for (Clip& c : track.clips) {
+                // Never downgrade: a coarse strip finishing after a finer one
+                // (they can race) must not replace it.
+                if (c.sourcePath != path || strip.frames.size() <= c.thumbnails.size()) continue;
+                c.thumbnails = strip.frames;
+                c.thumbnailSourceDurationSec = strip.durationSec > 0.0 ? strip.durationSec : c.sourceDurationSec();
+                applied = true;
+            }
+        }
+        if (applied) m_timeline->update();
+    });
+    watcher->setFuture(QtConcurrent::run(m_visualsPool, &ThumbnailGenerator::generate, path, frameCount, 120, 68));
+}
 
 void MainWindow::applyKlipyDockVisibility() {
     if (!m_klipyDock) return;
@@ -2905,6 +2927,7 @@ void MainWindow::restoreProjectState(const Project& state) {
         m_timeline->clearSelection(); // selection keys index into clip vectors that just changed
         refreshTrackViews();
         seekTimeline(m_currentTimelineSec);
+        regenerateAllClipVisuals(); // only fills gaps; cached, so near-instant
     }
 
     m_restoringUndoState = false;
