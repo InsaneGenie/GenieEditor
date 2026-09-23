@@ -69,6 +69,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <algorithm>
+#include <thread>
 #include <cmath>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
@@ -1670,13 +1671,20 @@ void MainWindow::startNextTranscriptionJob() {
     });
 
     watcher->setFuture(QtConcurrent::run(
-        [modelPath, source = job.sourcePath](QPromise<QVector<TranscriptSegment>>& promise) {
+        [modelPath, source = job.sourcePath, playing = m_playbackActive](QPromise<QVector<TranscriptSegment>>& promise) {
         promise.setProgressRange(0, 100);
         Transcriber transcriber(modelPath);
         transcriber.setProgressCallback([&promise](int percent) {
             if (!promise.isCanceled()) promise.setProgressValue(percent);
         });
         transcriber.setCancelCheck([&promise] { return promise.isCanceled(); });
+        // This runs automatically in the background, so it shouldn't claim the
+        // whole machine: half the cores (at least two) leaves real headroom for
+        // playback, decoding and the UI, and it steps aside entirely between
+        // windows while something is playing.
+        const unsigned hw = std::thread::hardware_concurrency();
+        transcriber.setThreadCount(std::max(2, static_cast<int>(hw / 2)));
+        transcriber.setPauseCheck([playing] { return playing->load(); });
         promise.addResult(transcriber.transcribe(source));
     }));
 }
@@ -1789,8 +1797,10 @@ void MainWindow::onUserToggledPlayback(bool nowPlaying) {
     if (nowPlaying) {
         m_masterClockElapsed.restart();
         m_masterClockTimer->start();
+        m_playbackActive->store(true);
     } else {
         m_masterClockTimer->stop();
+        m_playbackActive->store(false);
     }
     // Apply immediately rather than waiting for the next tick — important
     // when pausing, since the master clock (and thus future ticks) just
@@ -2677,6 +2687,7 @@ void MainWindow::openProjectFile(const QString& path) {
     // exist.
     m_isPlayingIntent = false;
     m_masterClockTimer->stop();
+    m_playbackActive->store(false);
     for (auto& audio : m_audioTracks) {
         if (audio.player) audio.player->pause();
     }
@@ -2713,6 +2724,7 @@ void MainWindow::onNewProject() {
 
     m_isPlayingIntent = false;
     m_masterClockTimer->stop();
+    m_playbackActive->store(false);
     for (auto& audio : m_audioTracks) {
         if (audio.player) audio.player->pause();
     }

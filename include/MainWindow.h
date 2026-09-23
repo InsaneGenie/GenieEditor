@@ -8,6 +8,8 @@
 #include <QSet>
 #include "Project.h"
 #include "UndoStack.h"
+#include <atomic>
+#include <memory>
 
 class PlayerWidget;
 class AudioPlayer;
@@ -403,6 +405,11 @@ private:
     // projectModified does not record the restored state as a fresh edit --
     // which would make undo push a new entry and redo unreachable.
     bool m_restoringUndoState = false;
+
+    // Whether playback is running, readable from worker threads. Shared
+    // rather than a plain member so a background job holds its own reference
+    // and never reads through a dangling MainWindow pointer.
+    std::shared_ptr<std::atomic_bool> m_playbackActive = std::make_shared<std::atomic_bool>(false);
 
     // Still sections from the last analysis, in timeline order. Mirrored into
     // the Timeline for display. Cleared by any recorded edit (see

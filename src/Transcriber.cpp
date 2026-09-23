@@ -11,6 +11,7 @@ extern "C" {
 #include <thread>
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
 
 namespace {
 
@@ -188,6 +189,14 @@ void Transcriber::setCancelCheck(std::function<bool()> check) {
     m_cancelCheck = std::move(check);
 }
 
+void Transcriber::setPauseCheck(std::function<bool()> check) {
+    m_pauseCheck = std::move(check);
+}
+
+void Transcriber::setThreadCount(int threads) {
+    m_threadCount = threads;
+}
+
 void Transcriber::progressTrampoline(whisper_context*, whisper_state*, int progress, void* userData) {
     auto* self = static_cast<Transcriber*>(userData);
     if (!self || !self->m_progressCallback) return;
@@ -262,6 +271,7 @@ QVector<TranscriptSegment> Transcriber::transcribe(const QString& mediaPath) {
     const unsigned hwThreads = std::thread::hardware_concurrency();
     params.n_threads = hwThreads > 2 ? static_cast<int>(hwThreads - 2)
                                      : (hwThreads > 0 ? static_cast<int>(hwThreads) : 4);
+    if (m_threadCount > 0) params.n_threads = m_threadCount;
 
     params.progress_callback = &Transcriber::progressTrampoline;
     params.progress_callback_user_data = this;
@@ -278,6 +288,15 @@ QVector<TranscriptSegment> Transcriber::transcribe(const QString& mediaPath) {
 
     while (true) {
         if (m_cancelCheck && m_cancelCheck()) return {};
+
+        // Yield between windows while asked to. Checked here rather than
+        // inside whisper, which can't be suspended mid-inference — so a pause
+        // takes effect within one window's worth of work (well under a minute
+        // on most machines) rather than instantly.
+        while (m_pauseCheck && m_pauseCheck()) {
+            if (m_cancelCheck && m_cancelCheck()) return {};
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
 
         stream.fill(window, kWindowSamples);
         if (!window.empty()) decodedAnything = true;

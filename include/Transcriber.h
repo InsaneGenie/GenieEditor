@@ -59,6 +59,16 @@ public:
     // there was no way to stop it short of quitting.
     void setCancelCheck(std::function<bool()> check);
 
+    // Polled before each ~10-minute window; while it returns true the job
+    // sleeps instead of starting the next one. MainWindow ties this to
+    // playback, so background transcription yields the CPU while you're
+    // actually watching something and resumes when you pause.
+    void setPauseCheck(std::function<bool()> check);
+
+    // Worker threads for whisper's inference. 0 (the default) keeps the
+    // previous behaviour: every logical core but two.
+    void setThreadCount(int threads);
+
 private:
     static void progressTrampoline(whisper_context* ctx, whisper_state* state, int progress, void* userData);
 
@@ -67,6 +77,8 @@ private:
     QString m_error;
     std::function<void(int)> m_progressCallback;
     std::function<bool()> m_cancelCheck;
+    std::function<bool()> m_pauseCheck;
+    int m_threadCount = 0;
 
     // Where the window being transcribed sits in the file, for scaling
     // whisper's per-window progress into whole-file progress.

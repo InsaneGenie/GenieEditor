@@ -157,6 +157,14 @@ PlayerWidget::PlayerWidget(QWidget* parent) : QWidget(parent) {
     // (or worse, drifting against) the actual Audio-track playback.
     mpv_set_option_string(m_mpv, "aid", "no");
 
+    // Decode on the GPU. mpv's default is hwdec=no — pure software decoding —
+    // which for 1080p/1440p H.264 or HEVC screen recordings is by far the
+    // largest CPU cost of playback. "auto-safe" only picks decoders mpv has
+    // whitelisted as reliable (D3D11VA on Windows, which the AMD driver
+    // provides) and silently falls back to software for anything the GPU
+    // can't handle, so there's no failure mode to guard against here.
+    mpv_set_option_string(m_mpv, "hwdec", "auto-safe");
+
     checkMpvError(mpv_initialize(m_mpv));
 
     // Poll mpv's event queue on a timer rather than wiring up its
