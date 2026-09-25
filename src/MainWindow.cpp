@@ -8,6 +8,7 @@
 #include "OverlayStageWidget.h"
 #include "KlipyPanel.h"
 #include "SoundEffectsPanel.h"
+#include "PinsPanel.h"
 #include "Transcriber.h"
 #include "FFmpegExporter.h"
 #include "MediaProbe.h"
@@ -669,6 +670,61 @@ void MainWindow::buildUi() {
                              | QDockWidget::DockWidgetClosable);
     tabifyDockWidget(m_transcriptDock, m_overlayDock);
 
+    // --- Pins ---------------------------------------------------------------
+    // Beside the transcript: both are "find a moment and go there" lists, and
+    // they're worth flipping between while reviewing a long recording.
+    m_pinsPanel = new PinsPanel();
+    connect(m_pinsPanel, &PinsPanel::jumpRequested, this, [this](double sec) {
+        seekTimeline(sec);
+        revealTimelineSec(sec);
+    });
+    connect(m_pinsPanel, &PinsPanel::renameRequested, this, [this](int index, const QString& label) {
+        if (index < 0 || index >= m_project.markers.size()) return;
+        m_project.markers[index].label = label;
+        m_timeline->update();
+        markProjectDirty();
+        recordUndoState("Rename Pin");
+    });
+    connect(m_pinsPanel, &PinsPanel::deleteRequested, this, [this](int index) {
+        if (index < 0 || index >= m_project.markers.size()) return;
+        m_project.markers.remove(index);
+        m_timeline->update();
+        markProjectDirty();
+        recordUndoState("Delete Pin");
+    });
+    connect(m_pinsPanel, &PinsPanel::addRequested, this, [this] {
+        const double sec = m_currentTimelineSec;
+        // Unlike the M key this never REMOVES a pin: a button labelled "+ Pin"
+        // that sometimes deletes one would be a trap. If a pin already sits on
+        // the playhead, the panel just opens it for naming instead.
+        bool exists = false;
+        for (const Marker& m : m_project.markers) {
+            if (m.isPin() && std::abs(m.startSec - sec) < 0.001) { exists = true; break; }
+        }
+        if (!exists) {
+            Marker pin;
+            pin.startSec = sec;
+            pin.endSec = sec;
+            pin.color = Theme::accent();
+            m_project.markers.push_back(pin);
+            m_timeline->update();
+            markProjectDirty();
+            recordUndoState("Add Pin");
+        }
+        m_pinsDock->show();
+        m_pinsDock->raise();
+        m_pinsPanel->beginRenameAt(sec);
+    });
+
+    m_pinsDock = new QDockWidget("Pins", this);
+    m_pinsDock->setObjectName("PinsDock");
+    m_pinsDock->setWidget(m_pinsPanel);
+    m_pinsDock->setFeatures(QDockWidget::DockWidgetMovable
+                          | QDockWidget::DockWidgetFloatable
+                          | QDockWidget::DockWidgetClosable);
+    tabifyDockWidget(m_overlayDock, m_pinsDock);
+    m_transcriptDock->raise();
+
     buildStatusBar();
 
     connect(m_player, &PlayerWidget::fileLoaded, this, &MainWindow::onPlayerFileLoaded);
@@ -691,6 +747,7 @@ void MainWindow::buildUi() {
     });
     connect(m_timeline, &Timeline::clipDeleted, this, &MainWindow::onClipDeleted);
     connect(m_timeline, &Timeline::downtimeRemoveRequested, this, &MainWindow::onDowntimeRemoveRequested);
+    connect(m_timeline, &Timeline::markersChanged, this, &MainWindow::refreshPinsPanel);
     connect(m_timeline, &Timeline::clipsMovedBetweenTracks, this, &MainWindow::onClipsMovedBetweenTracks);
     // The single place edits made INSIDE the timeline (drags, trims, splits,
     // deletes, pins) become "unsaved changes". MainWindow's own mutations —
@@ -843,6 +900,7 @@ void MainWindow::buildMenus() {
     viewMenu->addAction(m_timelineDock->toggleViewAction());
     viewMenu->addAction(m_mediaBrowserDock->toggleViewAction());
     viewMenu->addAction(m_overlayDock->toggleViewAction());
+    viewMenu->addAction(m_pinsDock->toggleViewAction());
     m_klipyViewAction = m_klipyDock->toggleViewAction();
     viewMenu->addAction(m_klipyViewAction);
     viewMenu->addAction(m_soundEffectsDock->toggleViewAction());
@@ -876,7 +934,7 @@ void MainWindow::resetLayout() {
     // and a closed dock with its View-menu entry also hidden is genuinely
     // unrecoverable. This is the way back.
     for (QDockWidget* dock : {m_mediaBrowserDock, m_klipyDock, m_soundEffectsDock, m_playerDock,
-                              m_transcriptDock, m_overlayDock, m_timelineDock}) {
+                              m_transcriptDock, m_overlayDock, m_pinsDock, m_timelineDock}) {
         if (dock) dock->setFloating(false);
         if (dock) dock->show();
     }
@@ -887,6 +945,7 @@ void MainWindow::resetLayout() {
     splitDockWidget(m_mediaBrowserDock, m_playerDock, Qt::Horizontal);
     splitDockWidget(m_playerDock, m_transcriptDock, Qt::Horizontal);
     tabifyDockWidget(m_transcriptDock, m_overlayDock);
+    tabifyDockWidget(m_overlayDock, m_pinsDock);
     m_transcriptDock->raise();
     addDockWidget(Qt::BottomDockWidgetArea, m_timelineDock);
     applyDefaultLayout();
@@ -2732,6 +2791,7 @@ void MainWindow::onNewProject() {
 
 void MainWindow::adoptLoadedProject(double playheadSec, double pixelsPerSecond) {
     setDowntimeRegions({});
+    refreshPinsPanel();
     // Every AudioPlayer is torn down and rebuilt rather than reused. They're
     // bound to a track INDEX, and the new project's track list has no
     // relationship to the old one's — a reused player would drive the wrong
@@ -2897,6 +2957,7 @@ void MainWindow::recordUndoState(const QString& label) {
     // The downtime removal path records first and then re-installs the
     // survivors, which it can shift exactly.
     setDowntimeRegions({});
+    refreshPinsPanel(); // cheap, and covers every edit that can move or drop pins (ripple deletes included)
     m_undoStack.record(m_project, label);
     updateUndoActions();
 }
@@ -2931,6 +2992,7 @@ void MainWindow::restoreProjectState(const Project& state) {
     }
 
     m_restoringUndoState = false;
+    refreshPinsPanel(); // pins and their labels are part of what undo restores
 
     // Marked dirty explicitly: an undo genuinely leaves the file on disk out of
     // step with what is on screen, even though it moved backwards.
@@ -3185,3 +3247,25 @@ void MainWindow::removeDowntimeRegions(QVector<int> indices, const QString& undo
     setDowntimeRegions(survivors); // ...so the shifted survivors go back after
     seekTimeline(std::clamp(playhead, 0.0, std::max(0.0, m_project.durationSec())));
 }
+
+// ---------------------------------------------------------------------------
+// Pins
+// ---------------------------------------------------------------------------
+
+void MainWindow::refreshPinsPanel() {
+    if (m_pinsPanel) m_pinsPanel->setPins(m_project.markers);
+}
+
+void MainWindow::revealTimelineSec(double sec) {
+    // Seeking moves the playhead but not the view. Jumping to a pin an hour
+    // away would otherwise leave the timeline showing somewhere else entirely,
+    // so when the target is off screen it's brought to a third of the way in —
+    // enough context before it to see what leads up to the moment.
+    QScrollBar* hbar = m_timelineScrollArea->horizontalScrollBar();
+    const int x = static_cast<int>(sec * m_timeline->pixelsPerSecond());
+    const int viewW = m_timelineScrollArea->viewport()->width();
+    if (x < hbar->value() || x > hbar->value() + viewW - 20) {
+        hbar->setValue(x - viewW / 3);
+    }
+}
+

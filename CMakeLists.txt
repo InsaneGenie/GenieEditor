@@ -113,6 +113,8 @@ add_executable(GenieEditor
     include/MyInstantsClient.h
     ${GENIE_SOURCE_DIR}/SoundEffectsPanel.cpp
     include/SoundEffectsPanel.h
+    ${GENIE_SOURCE_DIR}/PinsPanel.cpp
+    include/PinsPanel.h
     ${GENIE_SOURCE_DIR}/OverlayStageWidget.cpp
     include/OverlayStageWidget.h
     ${GENIE_SOURCE_DIR}/OverlayInspectorPanel.cpp

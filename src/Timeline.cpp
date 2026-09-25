@@ -4,6 +4,7 @@
 
 #include <QPainter>
 #include <QInputDialog>
+#include <QLineEdit>
 #include <limits>
 #include <QMouseEvent>
 #include <QWheelEvent>
@@ -932,6 +933,42 @@ void Timeline::paintEvent(QPaintEvent* event) {
         // rather than as a solid cyan blob.
         p.setBrush(QColor(0, 0, 0, 90));
         p.drawRoundedRect(QRectF(handle.center().x() - 0.9, handle.top() + 3.5, 1.8, 5.0), 0.9, 0.9);
+    }
+
+    // Pin labels, as small tags just right of each flag. A second pass rather
+    // than inside the loop above so every tag sits over every guide line, and
+    // so each can be clipped to stop short of the NEXT pin — labels run into
+    // each other at low zoom otherwise, and a clipped label still reads, where
+    // two overlapping ones don't.
+    {
+        QVector<const Marker*> pins;
+        for (const auto& marker : m_project->markers) {
+            if (marker.isPin()) pins.push_back(&marker);
+        }
+        std::sort(pins.begin(), pins.end(), [](const Marker* a, const Marker* b) { return a->startSec < b->startSec; });
+
+        p.setFont(Theme::uiFont(-2, QFont::DemiBold));
+        const QFontMetrics fm(p.font());
+        constexpr int kMaxLabelW = 180;
+        for (int i = 0; i < pins.size(); ++i) {
+            const Marker& pin = *pins[i];
+            if (pin.label.isEmpty()) continue;
+            const QRect handle = pinHandleRect(pin.startSec);
+            const int left = handle.right() + 3;
+            if (left > exposed.right() || left + kMaxLabelW < exposed.left()) continue;
+
+            int room = kMaxLabelW;
+            if (i + 1 < pins.size()) room = std::min(room, pinHandleRect(pins[i + 1]->startSec).left() - 4 - left);
+            if (room < 24) continue; // no space for even a few characters: the flag alone says "pin"
+
+            const QString text = fm.elidedText(pin.label, Qt::ElideRight, room - 8);
+            const QRect tag(left, handle.top(), fm.horizontalAdvance(text) + 8, handle.height() - 4);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 0, 0, 150));
+            p.drawRoundedRect(tag, 3, 3);
+            p.setPen(pin.color.lighter(125));
+            p.drawText(tag, Qt::AlignCenter, text);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1950,6 +1987,48 @@ void Timeline::keyPressEvent(QKeyEvent* event) {
 
 void Timeline::contextMenuEvent(QContextMenuEvent* event) {
     if (!m_project) return;
+
+    // Right-clicking a pin's flag: rename or remove it.
+    const int pinIndex = pinIndexAt(event->pos());
+    if (pinIndex >= 0) {
+        const double pinSec = m_project->markers[pinIndex].startSec;
+        QMenu menu(this);
+        QAction* rename = menu.addAction("Rename Pin\u2026");
+        QAction* remove = menu.addAction("Delete Pin");
+        QAction* chosen = menu.exec(event->globalPos());
+        // Re-found by time rather than trusting the index: the menu is modal,
+        // but the project isn't frozen while it's open (an autosave or a
+        // background job can still land).
+        auto currentIndex = [&]() {
+            for (int i = 0; i < m_project->markers.size(); ++i) {
+                const Marker& m = m_project->markers[i];
+                if (m.isPin() && std::abs(m.startSec - pinSec) < 1e-9) return i;
+            }
+            return -1;
+        };
+        if (chosen == rename) {
+            int i = currentIndex();
+            if (i < 0) return;
+            bool ok = false;
+            const QString label = QInputDialog::getText(this, "Rename Pin", "Label:", QLineEdit::Normal,
+                                                        m_project->markers[i].label, &ok).trimmed();
+            i = currentIndex();
+            if (!ok || i < 0 || label == m_project->markers[i].label) return;
+            m_project->markers[i].label = label;
+            update();
+            emit markersChanged();
+            emit projectModified();
+        } else if (chosen == remove) {
+            const int i = currentIndex();
+            if (i < 0) return;
+            m_project->markers.remove(i);
+            update();
+            emit markersChanged();
+            emit projectModified();
+        }
+        return;
+    }
+
     const HitResult hit = hitTest(event->pos());
     if (hit.clipIndex < 0) return;
 

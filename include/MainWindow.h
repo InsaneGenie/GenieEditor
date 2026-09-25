@@ -476,6 +476,12 @@ private:
     class SoundEffectsPanel* m_soundEffectsPanel = nullptr;
     QDockWidget* m_soundEffectsDock = nullptr;
 
+    class PinsPanel* m_pinsPanel = nullptr;
+    QDockWidget* m_pinsDock = nullptr;
+    void refreshPinsPanel();
+    // Scrolls the timeline so `sec` is on screen (without moving the playhead).
+    void revealTimelineSec(double sec);
+
     // Note: selection itself is owned entirely by Timeline (supports
     // multi-select) — MainWindow queries m_timeline->selectedClips() on
     // demand (e.g. for Split) rather than keeping a parallel copy.
