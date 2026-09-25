@@ -43,6 +43,36 @@ QString formatTime(double sec) {
 class LabelDelegate : public QStyledItemDelegate {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
+
+    // The app stylesheet gives every QLineEdit 6px/10px padding plus a border
+    // — right for a form field, but it needs ~30px of height, and an inline
+    // editor only gets the row's ~22px, so the text was drawn mostly outside
+    // the box and clipped to a sliver. The editor gets its own compact style
+    // instead, sized to the cell.
+    QWidget* createEditor(QWidget* parent, const QStyleOptionViewItem& option,
+                          const QModelIndex& index) const override {
+        QWidget* editor = QStyledItemDelegate::createEditor(parent, option, index);
+        if (auto* line = qobject_cast<QLineEdit*>(editor)) {
+            line->setStyleSheet(QString(
+                "QLineEdit { padding: 0px 5px; margin: 0px; border: 1px solid %1;"
+                " border-radius: 3px; background: %2; color: %3; }")
+                .arg(Theme::accent().name(), Theme::bg0().name(), Theme::text().name()));
+        }
+        return editor;
+    }
+
+    void updateEditorGeometry(QWidget* editor, const QStyleOptionViewItem& option,
+                              const QModelIndex&) const override {
+        editor->setGeometry(option.rect.adjusted(1, 1, -1, -1));
+    }
+
+    // A little taller than the default so the editor has room to breathe
+    // and the rows are easier to hit.
+    QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+        QSize size = QStyledItemDelegate::sizeHint(option, index);
+        size.setHeight(std::max(size.height(), option.fontMetrics.height() + 12));
+        return size;
+    }
     void setEditorData(QWidget* editor, const QModelIndex& index) const override {
         if (auto* line = qobject_cast<QLineEdit*>(editor)) {
             line->setText(index.data(kLabelRole).toString());
